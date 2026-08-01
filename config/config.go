@@ -21,6 +21,8 @@ type SherpaConfig struct {
 	NumThreads              int     `yaml:"num_threads"`
 	Rule1MinTrailingSilence float32 `yaml:"rule1_min_trailing_silence"`
 	Rule2MinTrailingSilence float32 `yaml:"rule2_min_trailing_silence"`
+	OfflineModel            string  `yaml:"offline_model"`
+	OfflineTokens           string  `yaml:"offline_tokens"`
 }
 
 type AudioConfig struct {
@@ -58,6 +60,9 @@ func defaultModelDir() string {
 
 func DefaultConfig() *Config {
 	modelDir := defaultModelDir()
+	home, _ := os.UserHomeDir()
+	offlineModelDir := filepath.Join(home, ".linux-voice-input", "models",
+		"sherpa-onnx-paraformer-zh-2023-09-14")
 	return &Config{
 		API: APIConfig{
 			Engine:  "sherpa",
@@ -72,6 +77,8 @@ func DefaultConfig() *Config {
 			NumThreads:              4,
 			Rule1MinTrailingSilence: 2.4,
 			Rule2MinTrailingSilence: 1.2,
+			OfflineModel:            filepath.Join(offlineModelDir, "model.int8.onnx"),
+			OfflineTokens:           filepath.Join(offlineModelDir, "tokens.txt"),
 		},
 		Audio: AudioConfig{
 			SampleRate: 16000,

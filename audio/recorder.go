@@ -103,6 +103,15 @@ func (r *Recorder) Stop() error {
 	return nil
 }
 
+// GetSamplesFloat32 returns the recorded audio buffer as float32 samples in range [-1, 1].
+func (r *Recorder) GetSamplesFloat32() []float32 {
+	r.mu.Lock()
+	data := make([]int16, len(r.buffer))
+	copy(data, r.buffer)
+	r.mu.Unlock()
+	return int16ToFloat32(data)
+}
+
 func (r *Recorder) SaveWAV(filepath string) error {
 	r.mu.Lock()
 	data := make([]int16, len(r.buffer))

@@ -145,3 +145,64 @@ func (s *SherpaStream) Close() {
 		s.stream = nil
 	}
 }
+
+// SherpaOfflineRecognizer wraps the sherpa-onnx OfflineRecognizer for
+// high-accuracy final transcription after recording completes.
+type SherpaOfflineRecognizer struct {
+	recognizer *sherpa.OfflineRecognizer
+}
+
+func NewSherpaOfflineRecognizer(cfg config.SherpaConfig) (*SherpaOfflineRecognizer, error) {
+	if cfg.OfflineModel == "" {
+		return nil, fmt.Errorf("offline_model path is not configured")
+	}
+
+	tokensTxtPath, err := EnsureTokensTxt(cfg.OfflineTokens)
+	if err != nil {
+		return nil, fmt.Errorf("prepare offline tokens: %w", err)
+	}
+	log.Printf("Using offline tokens file: %s", tokensTxtPath)
+
+	numThreads := cfg.NumThreads
+	if numThreads <= 0 {
+		numThreads = 4
+	}
+
+	recognizerConfig := &sherpa.OfflineRecognizerConfig{}
+	recognizerConfig.FeatConfig = sherpa.FeatureConfig{
+		SampleRate: 16000,
+		FeatureDim: 80,
+	}
+	recognizerConfig.ModelConfig.Paraformer.Model = cfg.OfflineModel
+	recognizerConfig.ModelConfig.Tokens = tokensTxtPath
+	recognizerConfig.ModelConfig.NumThreads = numThreads
+	recognizerConfig.ModelConfig.Provider = "cpu"
+	recognizerConfig.ModelConfig.ModelType = "paraformer"
+	recognizerConfig.DecodingMethod = "greedy_search"
+
+	recognizer := sherpa.NewOfflineRecognizer(recognizerConfig)
+	if recognizer == nil {
+		return nil, fmt.Errorf("failed to create sherpa offline recognizer")
+	}
+
+	return &SherpaOfflineRecognizer{recognizer: recognizer}, nil
+}
+
+// TranscribeAudioSamples performs offline recognition on the given audio samples.
+func (r *SherpaOfflineRecognizer) TranscribeAudioSamples(samples []float32) (string, error) {
+	stream := sherpa.NewOfflineStream(r.recognizer)
+	defer sherpa.DeleteOfflineStream(stream)
+
+	stream.AcceptWaveform(16000, samples)
+	r.recognizer.Decode(stream)
+
+	result := stream.GetResult()
+	return strings.TrimSpace(result.Text), nil
+}
+
+func (r *SherpaOfflineRecognizer) Close() {
+	if r.recognizer != nil {
+		sherpa.DeleteOfflineRecognizer(r.recognizer)
+		r.recognizer = nil
+	}
+}

@@ -364,7 +364,20 @@ func runTestMode(cfg *config.Config) {
 	fmt.Println("[TEST] 开始识别...")
 	var text string
 	if cfg.API.Engine == "sherpa" {
-		text = sherpaStream.Finish()
+		streamingText := sherpaStream.Finish()
+		fmt.Printf("[TEST] 流式识别结果: %s\n", streamingText)
+
+		fmt.Println("[TEST] 使用离线大模型重新识别...")
+		offlineRecognizer, offlineErr := api.NewSherpaOfflineRecognizer(cfg.Sherpa)
+		if offlineErr != nil {
+			fmt.Printf("[TEST] 离线模型不可用，使用流式结果: %v\n", offlineErr)
+			text = streamingText
+		} else {
+			defer offlineRecognizer.Close()
+			samples := recorder.GetSamplesFloat32()
+			text, _ = offlineRecognizer.TranscribeAudioSamples(samples)
+			fmt.Printf("[TEST] 离线模型识别结果: %s\n", text)
+		}
 	} else {
 		apiClient := api.NewClient(cfg.API.BaseURL, cfg.API.Key, cfg.API.Model)
 		var err error
@@ -478,8 +491,16 @@ func runNormalMode(cfg *config.Config) {
 
 	var text string
 	if cfg.API.Engine == "sherpa" {
-		log.Println("Finalizing streaming recognition...")
-		text = sherpaStream.Finish()
+		log.Println("Finalizing with offline model for better accuracy...")
+		offlineRecognizer, offlineErr := api.NewSherpaOfflineRecognizer(cfg.Sherpa)
+		if offlineErr != nil {
+			log.Printf("Offline model unavailable, falling back to streaming result: %v", offlineErr)
+			text = sherpaStream.Finish()
+		} else {
+			defer offlineRecognizer.Close()
+			samples := recorder.GetSamplesFloat32()
+			text, _ = offlineRecognizer.TranscribeAudioSamples(samples)
+		}
 	} else {
 		notifyIf(cfg.Notifications.Start, "语音输入", "识别中", false)
 
