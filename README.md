@@ -1,78 +1,32 @@
 # Linux Voice Input
 
-一个面向 Ubuntu/X11 桌面的语音输入小工具。
+一个面向 Ubuntu/X11 桌面的轻量语音输入工具。
 
-通过 Ubuntu Desktop 自定义快捷键触发：第一次触发开始录音，第二次触发停止录音并识别，把识别结果粘贴到当前输入框。支持本地流式识别（sherpa-onnx，边录边识别，无需联网）和在线 API 识别（SiliconFlow）。
+通过 Ubuntu Desktop 自定义快捷键触发：第一次触发开始录音，第二次触发停止录音并识别，把识别结果粘贴到当前输入框。
 
-## 演示
+支持两种识别引擎：
+- **sherpa（推荐）**：本地三模型 pipeline，完全离线，边录边识别
+- **whisper**：在线 API（SiliconFlow），需要联网
 
-![Linux Voice Input Demo](assets/demo.gif)
-
-## 设计方案与优势
-
-本项目没有实现一个完整的 Linux 输入法引擎，也没有常驻抢焦点的 UI，而是采用：
+## 识别流程（sherpa 引擎）
 
 ```text
-Ubuntu 自定义快捷键 -> 单实例 toggle 进程 -> 录音 -> 语音识别 API -> 剪贴板 + Ctrl+V 粘贴
+录音中：流式 ASR 实时预览（通知显示）
+    ↓ 停止录音
+离线大模型 ASR 精确识别
+    ↓
+CT-Transformer 标点恢复
+    ↓
+剪贴板 + Ctrl+V 粘贴
 ```
 
-这个方案的灵感来自下面这条简单命令：
+三个模型各司其职：
 
-```bash
-echo -n "测试输入" | xclip -selection clipboard && xdotool key --clearmodifiers ctrl+v
-```
-
-也就是先把文本写入 X11 剪贴板，再模拟一次 `Ctrl+V`，让文本进入当前焦点所在的输入框。本项目只是把其中的"测试输入"替换成语音识别后的文本。
-
-相比传统输入法或完整语音输入法方案，这个方案更轻便：
-
-- **不接入 IBus/Fcitx 输入法框架**：不用实现输入法 engine，不需要处理候选词、预编辑文本、输入上下文等复杂协议。
-- **不替换现有输入法**：可以继续使用原来的中文输入法、英文输入、快捷键和输入习惯，语音输入只是一个额外工具。
-- **不与原输入法冲突**：最终文本通过剪贴板粘贴进入目标输入框，不依赖当前输入法状态，也不会切换或劫持输入法。
-- **安装和配置更简单**：不需要修改系统输入法框架，不需要注册新的输入法，也不需要切换输入源；只要配置一个 Ubuntu 自定义快捷键即可使用。
-- **兼容性更直接**：只要目标应用支持标准剪贴板粘贴，通常就能输入；对浏览器、编辑器、聊天软件、IDE 等都比较友好。
-- **更容易排查问题**：核心链路是录音、API、剪贴板、粘贴四步，日志里能直接看到每一步状态。
-
-和传统输入法方案的核心差异：
-
-| 维度 | 本项目 | 传统输入法/完整语音输入法 |
+| 阶段 | 模型 | 作用 |
 | --- | --- | --- |
-| 系统集成方式 | 快捷键触发 + 剪贴板粘贴 | 接入 IBus/Fcitx 等输入法框架 |
-| 是否替换输入法 | 不替换，只作为辅助工具 | 通常需要作为输入法/输入源启用 |
-| 与现有输入法关系 | 不影响原有输入法，互不冲突 | 可能涉及输入法切换、候选框、输入上下文 |
-| 实现复杂度 | 低，主要关注录音和识别链路 | 高，需要处理输入法协议和桌面环境差异 |
-| 兼容方式 | 依赖目标应用支持粘贴 | 依赖输入法框架和应用输入上下文 |
-| 适合场景 | 快速语音输入、辅助输入、个人工具 | 深度系统集成、长期作为主输入法使用 |
-
-因此当前实现更适合定位为一个 **轻量语音输入辅助工具**，而不是替代系统输入法。
-
-## 工作方式
-
-程序本身不抢全局快捷键，而是交给 Ubuntu Desktop 的自定义快捷键启动。
-
-流程：
-
-1. 第一次执行 `linux-voice-input`
-   - 检测到没有运行中的实例
-   - 记录当前焦点窗口
-   - 开始录音
-   - 通过桌面通知提示正在录音
-   - 监听 Unix Socket 等待停止指令
-
-2. 第二次执行 `linux-voice-input`
-   - 检测到已有实例
-   - 向已有实例发送 `stop` 指令
-   - 自己退出
-
-3. 第一个实例收到 `stop`
-   - 停止录音
-   - 如果录音小于 1 秒，认为是误触发并忽略
-   - 保存临时 WAV
-   - 调用 SiliconFlow 语音识别 API
-   - 写入剪贴板
-   - 激活首次记录的窗口
-   - 模拟 `Ctrl+V` 粘贴
-   - 退出
+| 实时预览 | Streaming Paraformer | 录音中实时显示部分识别结果 |
+| 精确识别 | Paraformer-large (离线) | 停止后对完整音频做高准确率识别 |
+| 标点恢复 | CT-Transformer | 对识别结果添加标点符号 |
 
 ## 系统依赖
 
@@ -89,7 +43,7 @@ sudo apt install -y \
 
 依赖说明：
 
-- `portaudio19-dev`：麦克风录音
+- `portaudio19-dev`：麦克风录音（编译时需要）
 - `xclip`：写入 X11 剪贴板
 - `xdotool`：获取/激活窗口并模拟 `Ctrl+V`
 - `libnotify-bin`：提供 `notify-send` 桌面通知 fallback
@@ -103,25 +57,84 @@ sudo apt install -y \
 go build -o linux-voice-input .
 ```
 
+需要 Go 1.22+ 和 CGO（sherpa-onnx 依赖 C 共享库，通过 Go 模块自动引入）。
+
+## 模型下载
+
+使用 sherpa 引擎需要下载三个模型，存放在 `~/.linux-voice-input/models/` 目录下：
+
+```bash
+mkdir -p ~/.linux-voice-input/models
+cd ~/.linux-voice-input/models
+
+# 1. 流式 ASR 模型（实时预览用，中英双语）
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-paraformer-bilingual-zh-en.tar.bz2
+tar -xjf sherpa-onnx-streaming-paraformer-bilingual-zh-en.tar.bz2
+rm sherpa-onnx-streaming-paraformer-bilingual-zh-en.tar.bz2
+
+# 2. 离线 ASR 大模型（精确识别用，中文）
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-2023-09-14.tar.bz2
+tar -xjf sherpa-onnx-paraformer-zh-2023-09-14.tar.bz2
+rm sherpa-onnx-paraformer-zh-2023-09-14.tar.bz2
+
+# 3. 标点恢复模型（中英文标点）
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12.tar.bz2
+tar -xjf sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12.tar.bz2
+rm sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12.tar.bz2
+```
+
+下载完成后目录结构：
+
+```
+~/.linux-voice-input/models/
+├── sherpa-onnx-streaming-paraformer-bilingual-zh-en/   (~30MB)
+│   ├── encoder.int8.onnx
+│   ├── decoder.int8.onnx
+│   └── tokens.txt
+├── sherpa-onnx-paraformer-zh-2023-09-14/               (~220MB)
+│   ├── model.int8.onnx
+│   └── tokens.txt
+└── sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12/  (~280MB)
+    └── model.onnx
+```
+
+模型来源：
+- 流式模型基于阿里 FunASR Paraformer 在线版，由 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 项目转换
+- 离线模型基于阿里 FunASR Paraformer-large，准确率与在线 API 相当
+- 标点模型基于阿里 FunASR CT-Transformer，支持中英文标点恢复
+
 ## 配置文件
 
-首次运行会自动创建配置文件；如果检测到旧路径 `~/.config/linux-voice-input/config.yaml`，会自动迁移到新路径：
+首次运行会自动创建配置文件：
 
 ```text
 ~/.linux-voice-input/config.yaml
 ```
 
-### 方式一：本地流式识别（推荐，使用 sherpa-onnx）
+### 方式一：本地识别（推荐，使用 sherpa-onnx）
 
-完全离线，边录边识别，停止录音时几乎立即得到结果：
+只需设置 `api.engine: sherpa`，其余使用默认值即可（默认指向上面下载的模型路径）：
+
+```yaml
+api:
+  engine: "sherpa"
+audio:
+  sample_rate: 16000
+restore_clipboard: true
+```
+
+完整配置（一般不需要手动填写，程序有默认值）：
 
 ```yaml
 api:
   engine: "sherpa"
 sherpa:
-  encoder: "~/.cache/modelscope/hub/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx/model_quant.onnx"
-  decoder: "~/.cache/modelscope/hub/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx/decoder_quant.onnx"
-  tokens: "~/.cache/modelscope/hub/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx/tokens.json"
+  encoder: "/home/<user>/.linux-voice-input/models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/encoder.int8.onnx"
+  decoder: "/home/<user>/.linux-voice-input/models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/decoder.int8.onnx"
+  tokens: "/home/<user>/.linux-voice-input/models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/tokens.txt"
+  offline_model: "/home/<user>/.linux-voice-input/models/sherpa-onnx-paraformer-zh-2023-09-14/model.int8.onnx"
+  offline_tokens: "/home/<user>/.linux-voice-input/models/sherpa-onnx-paraformer-zh-2023-09-14/tokens.txt"
+  punct_model: "/home/<user>/.linux-voice-input/models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12/model.onnx"
   num_threads: 4
   rule1_min_trailing_silence: 2.4
   rule2_min_trailing_silence: 1.2
@@ -129,8 +142,6 @@ audio:
   sample_rate: 16000
 restore_clipboard: true
 ```
-
-模型文件可以从 ModelScope 下载，或者如果你安装了 vocotype-linux，模型已经在 `~/.cache/modelscope/hub/models/iic/` 下。
 
 ### 方式二：在线识别（使用 SiliconFlow API）
 
@@ -145,20 +156,48 @@ audio:
 restore_clipboard: true
 ```
 
-字段说明：
+### 配置字段说明
 
-- `api.engine`：识别引擎，`"sherpa"`（本地流式，推荐）或 `"whisper"`（在线）
-- `api.key`：SiliconFlow API Key，使用在线引擎时必须配置
-- `api.base_url`：SiliconFlow API 地址
-- `api.model`：语音识别模型，默认 `FunAudioLLM/SenseVoiceSmall`
-- `sherpa.encoder`：流式 Paraformer encoder 模型路径
-- `sherpa.decoder`：流式 Paraformer decoder 模型路径
-- `sherpa.tokens`：tokens 文件路径（支持 `.json` 和 `.txt` 格式）
-- `sherpa.num_threads`：推理线程数，默认 4
-- `sherpa.rule1_min_trailing_silence`：较长静音后结束一段话（秒），默认 2.4
-- `sherpa.rule2_min_trailing_silence`：较短静音后结束一段话（秒），默认 1.2
-- `audio.sample_rate`：录音采样率，默认 16000
-- `restore_clipboard`：粘贴后是否恢复原剪贴板内容
+| 字段 | 说明 |
+| --- | --- |
+| `api.engine` | 识别引擎：`"sherpa"`（本地，推荐）或 `"whisper"`（在线） |
+| `api.key` | SiliconFlow API Key，whisper 引擎必须配置 |
+| `api.base_url` | SiliconFlow API 地址 |
+| `api.model` | 在线识别模型，默认 `FunAudioLLM/SenseVoiceSmall` |
+| `sherpa.encoder` | 流式 Paraformer encoder 模型路径 |
+| `sherpa.decoder` | 流式 Paraformer decoder 模型路径 |
+| `sherpa.tokens` | 流式模型 tokens 文件路径 |
+| `sherpa.offline_model` | 离线 Paraformer-large 模型路径 |
+| `sherpa.offline_tokens` | 离线模型 tokens 文件路径 |
+| `sherpa.punct_model` | CT-Transformer 标点模型路径 |
+| `sherpa.num_threads` | 推理线程数，默认 4 |
+| `sherpa.rule1_min_trailing_silence` | 较长静音后结束一段话（秒），默认 2.4 |
+| `sherpa.rule2_min_trailing_silence` | 较短静音后结束一段话（秒），默认 1.2 |
+| `audio.sample_rate` | 录音采样率，默认 16000 |
+| `restore_clipboard` | 粘贴后是否恢复原剪贴板内容 |
+
+## 测试模式
+
+使用 `--test` 参数启动测试模式，自动录音 3 秒并识别，方便验证配置是否正确：
+
+```bash
+./linux-voice-input --test
+```
+
+输出示例：
+
+```
+[TEST] 开始录音，持续 3 秒...
+[TEST] 录音结束
+[TEST] 保存录音到: /home/user/.linux-voice-input/test-temp.wav
+[TEST] 开始识别...
+[TEST] 流式识别结果 (耗时 15ms): 我们在测试语音识别
+[TEST] 使用离线大模型重新识别...
+[TEST] 离线模型识别结果 (耗时 680ms): 我们在测试语音识别
+[TEST] 添加标点...
+[TEST] 加标点后 (耗时 95ms): 我们在测试语音识别。
+[TEST] 识别结果: 我们在测试语音识别。
+```
 
 ## Ubuntu 快捷键配置
 
@@ -171,12 +210,7 @@ Settings -> Keyboard -> Keyboard Shortcuts -> Custom Shortcuts
 添加自定义快捷键：
 
 - Name: `Linux Voice Input`
-- Command:
-
-```bash
-/home/ericwyn/dev/golang/linux-voice-input/linux-voice-input
-```
-
+- Command: `/path/to/linux-voice-input`
 - Shortcut: 例如 `Alt+Shift+G`
 
 使用方式：
@@ -187,72 +221,24 @@ Settings -> Keyboard -> Keyboard Shortcuts -> Custom Shortcuts
 
 ## 桌面通知
 
-程序优先通过 DBus 发送桌面通知，并复用同一个 notification id 更新同一条通知，避免刷屏；如果 DBus 不可用，会 fallback 到 `notify-send`。
+使用 sherpa 引擎时，录音过程中通知会持续更新显示实时识别文字；最终结果通知 3 秒后自动关闭。
 
 常见通知状态：
 
-- `录音中`
-- `识别中`
-- `已输入：...`
+- `录音中: <实时识别文字>`
+- `已输入：<最终结果>`
 - `录音过短，已忽略`
 - `识别失败`
-- `粘贴失败`
-
-其中 `录音中` 和 `识别中` 是中间状态，会更新同一条通知；成功、失败、忽略等结束状态会继续更新同一条通知，并在 3 秒后自动关闭。
 
 ## 日志
 
-程序会记录运行日志到配置文件所在的同一个目录：
-
-```text
-~/.linux-voice-input/
-```
-
-当天日志文件：
-
-```text
-~/.linux-voice-input/run-YYYY-MM-DD.log
-```
-
-便捷入口：
-
-```text
-~/.linux-voice-input/run.log
-```
-
-查看实时日志：
+日志目录：`~/.linux-voice-input/`
 
 ```bash
 tail -f ~/.linux-voice-input/run.log
 ```
 
-日志保留策略：
-
-- 只保留最近 3 天的 `run-*.log`
-- 程序启动时会自动清理更早的日志
-
-## 临时音频文件
-
-录音临时文件路径：
-
-```text
-/tmp/linux-voice-input.wav
-```
-
-清理策略：
-
-- 正常流程下，识别结束后会自动删除该 WAV 文件
-- 如果程序异常退出，可能残留这个临时文件
-- 下次运行会覆盖同名文件，不会无限堆积历史 WAV
-
-## 误触发保护
-
-录音时长小于 1 秒时，程序认为是误触发：
-
-- 不保存 WAV
-- 不调用语音识别 API
-- 不粘贴内容
-- 显示通知：`录音过短，已忽略`
+日志包含配置信息、各模型处理耗时、识别结果等，方便排查问题。自动保留最近 3 天。
 
 ## 排查问题
 
@@ -260,20 +246,19 @@ tail -f ~/.linux-voice-input/run.log
 
 1. 确认当前是 X11 会话
 2. 确认已安装 `xclip` 和 `xdotool`
-3. 查看日志：
-
-```bash
-tail -f ~/.linux-voice-input/run.log
-```
-
+3. 查看日志：`tail -f ~/.linux-voice-input/run.log`
 4. 手动测试粘贴链路：
 
 ```bash
 echo -n "测试输入" | xclip -selection clipboard && xdotool key --clearmodifiers ctrl+v
 ```
 
-如果识别失败：
+如果识别为空：
 
-1. 检查 `~/.linux-voice-input/config.yaml` 中的 `api.key`
-2. 检查网络是否能访问 `https://api.siliconflow.cn`
-3. 查看日志中的 API 错误信息
+1. 运行 `./linux-voice-input --test` 验证模型是否正常
+2. 检查模型文件是否完整下载
+3. 检查日志中的错误信息
+
+## 误触发保护
+
+录音时长小于 1 秒时忽略，不识别、不粘贴、通知提示"录音过短，已忽略"。

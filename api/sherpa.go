@@ -206,3 +206,41 @@ func (r *SherpaOfflineRecognizer) Close() {
 		r.recognizer = nil
 	}
 }
+
+// SherpaPunctuation wraps sherpa-onnx OfflinePunctuation for adding
+// punctuation to plain text after ASR.
+type SherpaPunctuation struct {
+	punct *sherpa.OfflinePunctuation
+}
+
+func NewSherpaPunctuation(modelPath string) (*SherpaPunctuation, error) {
+	if modelPath == "" {
+		return nil, fmt.Errorf("punct_model path is not configured")
+	}
+
+	config := &sherpa.OfflinePunctuationConfig{}
+	config.Model.CtTransformer = modelPath
+	config.Model.NumThreads = 1
+	config.Model.Provider = "cpu"
+
+	punct := sherpa.NewOfflinePunctuation(config)
+	if punct == nil {
+		return nil, fmt.Errorf("failed to create sherpa punctuation model")
+	}
+
+	return &SherpaPunctuation{punct: punct}, nil
+}
+
+func (p *SherpaPunctuation) AddPunct(text string) string {
+	if text == "" {
+		return ""
+	}
+	return p.punct.AddPunct(text)
+}
+
+func (p *SherpaPunctuation) Close() {
+	if p.punct != nil {
+		sherpa.DeleteOfflinePunc(p.punct)
+		p.punct = nil
+	}
+}

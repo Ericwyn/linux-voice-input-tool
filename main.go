@@ -364,10 +364,12 @@ func runTestMode(cfg *config.Config) {
 	fmt.Println("[TEST] 开始识别...")
 	var text string
 	if cfg.API.Engine == "sherpa" {
+		startTime := time.Now()
 		streamingText := sherpaStream.Finish()
-		fmt.Printf("[TEST] 流式识别结果: %s\n", streamingText)
+		fmt.Printf("[TEST] 流式识别结果 (耗时 %dms): %s\n", time.Since(startTime).Milliseconds(), streamingText)
 
 		fmt.Println("[TEST] 使用离线大模型重新识别...")
+		startTime = time.Now()
 		offlineRecognizer, offlineErr := api.NewSherpaOfflineRecognizer(cfg.Sherpa)
 		if offlineErr != nil {
 			fmt.Printf("[TEST] 离线模型不可用，使用流式结果: %v\n", offlineErr)
@@ -376,7 +378,20 @@ func runTestMode(cfg *config.Config) {
 			defer offlineRecognizer.Close()
 			samples := recorder.GetSamplesFloat32()
 			text, _ = offlineRecognizer.TranscribeAudioSamples(samples)
-			fmt.Printf("[TEST] 离线模型识别结果: %s\n", text)
+			fmt.Printf("[TEST] 离线模型识别结果 (耗时 %dms): %s\n", time.Since(startTime).Milliseconds(), text)
+		}
+
+		if text != "" && cfg.Sherpa.PunctModel != "" {
+			fmt.Println("[TEST] 添加标点...")
+			startTime = time.Now()
+			punct, punctErr := api.NewSherpaPunctuation(cfg.Sherpa.PunctModel)
+			if punctErr != nil {
+				fmt.Printf("[TEST] 标点模型不可用: %v\n", punctErr)
+			} else {
+				defer punct.Close()
+				text = punct.AddPunct(text)
+				fmt.Printf("[TEST] 加标点后 (耗时 %dms): %s\n", time.Since(startTime).Milliseconds(), text)
+			}
 		}
 	} else {
 		apiClient := api.NewClient(cfg.API.BaseURL, cfg.API.Key, cfg.API.Model)
@@ -492,6 +507,7 @@ func runNormalMode(cfg *config.Config) {
 	var text string
 	if cfg.API.Engine == "sherpa" {
 		log.Println("Finalizing with offline model for better accuracy...")
+		startTime := time.Now()
 		offlineRecognizer, offlineErr := api.NewSherpaOfflineRecognizer(cfg.Sherpa)
 		if offlineErr != nil {
 			log.Printf("Offline model unavailable, falling back to streaming result: %v", offlineErr)
@@ -500,6 +516,20 @@ func runNormalMode(cfg *config.Config) {
 			defer offlineRecognizer.Close()
 			samples := recorder.GetSamplesFloat32()
 			text, _ = offlineRecognizer.TranscribeAudioSamples(samples)
+			log.Printf("Offline recognition done in %dms: %s", time.Since(startTime).Milliseconds(), text)
+		}
+
+		if text != "" && cfg.Sherpa.PunctModel != "" {
+			log.Println("Adding punctuation...")
+			startTime = time.Now()
+			punct, punctErr := api.NewSherpaPunctuation(cfg.Sherpa.PunctModel)
+			if punctErr != nil {
+				log.Printf("Punctuation model unavailable: %v", punctErr)
+			} else {
+				defer punct.Close()
+				text = punct.AddPunct(text)
+				log.Printf("Punctuation done in %dms: %s", time.Since(startTime).Milliseconds(), text)
+			}
 		}
 	} else {
 		notifyIf(cfg.Notifications.Start, "语音输入", "识别中", false)
