@@ -8,9 +8,19 @@ import (
 )
 
 type APIConfig struct {
+	Engine  string `yaml:"engine"` // "whisper" (online) or "sherpa" (local streaming)
 	Key     string `yaml:"key"`
 	BaseURL string `yaml:"base_url"`
 	Model   string `yaml:"model"`
+}
+
+type SherpaConfig struct {
+	Encoder                 string  `yaml:"encoder"`
+	Decoder                 string  `yaml:"decoder"`
+	Tokens                  string  `yaml:"tokens"`
+	NumThreads              int     `yaml:"num_threads"`
+	Rule1MinTrailingSilence float32 `yaml:"rule1_min_trailing_silence"`
+	Rule2MinTrailingSilence float32 `yaml:"rule2_min_trailing_silence"`
 }
 
 type AudioConfig struct {
@@ -31,17 +41,37 @@ type NotificationsConfig struct {
 
 type Config struct {
 	API              APIConfig           `yaml:"api"`
+	Sherpa           SherpaConfig        `yaml:"sherpa"`
 	Audio            AudioConfig         `yaml:"audio"`
 	Notifications    NotificationsConfig `yaml:"notifications"`
 	RestoreClipboard bool                `yaml:"restore_clipboard"`
 }
 
+func defaultModelDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".linux-voice-input", "models",
+		"sherpa-onnx-streaming-paraformer-bilingual-zh-en")
+}
+
 func DefaultConfig() *Config {
+	modelDir := defaultModelDir()
 	return &Config{
 		API: APIConfig{
+			Engine:  "sherpa",
 			Key:     "",
 			BaseURL: "https://api.siliconflow.cn/v1",
 			Model:   "FunAudioLLM/SenseVoiceSmall",
+		},
+		Sherpa: SherpaConfig{
+			Encoder:                 filepath.Join(modelDir, "encoder.int8.onnx"),
+			Decoder:                 filepath.Join(modelDir, "decoder.int8.onnx"),
+			Tokens:                  filepath.Join(modelDir, "tokens.txt"),
+			NumThreads:              4,
+			Rule1MinTrailingSilence: 2.4,
+			Rule2MinTrailingSilence: 1.2,
 		},
 		Audio: AudioConfig{
 			SampleRate: 16000,

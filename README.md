@@ -2,7 +2,7 @@
 
 一个面向 Ubuntu/X11 桌面的语音输入小工具。
 
-通过 Ubuntu Desktop 自定义快捷键触发：第一次触发开始录音，第二次触发停止录音、调用 SiliconFlow 语音识别接口，并把识别结果粘贴到当前输入框。
+通过 Ubuntu Desktop 自定义快捷键触发：第一次触发开始录音，第二次触发停止录音并识别，把识别结果粘贴到当前输入框。支持本地流式识别（sherpa-onnx，边录边识别，无需联网）和在线 API 识别（SiliconFlow）。
 
 ## 演示
 
@@ -111,43 +111,53 @@ go build -o linux-voice-input .
 ~/.linux-voice-input/config.yaml
 ```
 
-示例：
+### 方式一：本地流式识别（推荐，使用 sherpa-onnx）
+
+完全离线，边录边识别，停止录音时几乎立即得到结果：
 
 ```yaml
 api:
+  engine: "sherpa"
+sherpa:
+  encoder: "~/.cache/modelscope/hub/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx/model_quant.onnx"
+  decoder: "~/.cache/modelscope/hub/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx/decoder_quant.onnx"
+  tokens: "~/.cache/modelscope/hub/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx/tokens.json"
+  num_threads: 4
+  rule1_min_trailing_silence: 2.4
+  rule2_min_trailing_silence: 1.2
+audio:
+  sample_rate: 16000
+restore_clipboard: true
+```
+
+模型文件可以从 ModelScope 下载，或者如果你安装了 vocotype-linux，模型已经在 `~/.cache/modelscope/hub/models/iic/` 下。
+
+### 方式二：在线识别（使用 SiliconFlow API）
+
+```yaml
+api:
+  engine: "whisper"
   key: "sk-xxxxxxxx"
   base_url: "https://api.siliconflow.cn/v1"
   model: "FunAudioLLM/SenseVoiceSmall"
 audio:
   sample_rate: 16000
-notifications:
-  start: true
-  success: true
-  ignored: true
-  record_start_failed: true
-  record_stop_failed: true
-  save_failed: true
-  transcribe_failed: true
-  empty_result: true
-  paste_failed: true
 restore_clipboard: true
 ```
 
 字段说明：
 
-- `api.key`：SiliconFlow API Key，必须配置
+- `api.engine`：识别引擎，`"sherpa"`（本地流式，推荐）或 `"whisper"`（在线）
+- `api.key`：SiliconFlow API Key，使用在线引擎时必须配置
 - `api.base_url`：SiliconFlow API 地址
 - `api.model`：语音识别模型，默认 `FunAudioLLM/SenseVoiceSmall`
+- `sherpa.encoder`：流式 Paraformer encoder 模型路径
+- `sherpa.decoder`：流式 Paraformer decoder 模型路径
+- `sherpa.tokens`：tokens 文件路径（支持 `.json` 和 `.txt` 格式）
+- `sherpa.num_threads`：推理线程数，默认 4
+- `sherpa.rule1_min_trailing_silence`：较长静音后结束一段话（秒），默认 2.4
+- `sherpa.rule2_min_trailing_silence`：较短静音后结束一段话（秒），默认 1.2
 - `audio.sample_rate`：录音采样率，默认 16000
-- `notifications.start`：开始录音时是否通知
-- `notifications.success`：识别并输入成功后是否通知
-- `notifications.ignored`：录音过短被忽略时是否通知
-- `notifications.record_start_failed`：录音启动失败时是否通知
-- `notifications.record_stop_failed`：录音停止失败时是否通知
-- `notifications.save_failed`：保存临时录音失败时是否通知
-- `notifications.transcribe_failed`：语音识别失败时是否通知
-- `notifications.empty_result`：未识别到文字时是否通知
-- `notifications.paste_failed`：粘贴失败时是否通知
 - `restore_clipboard`：粘贴后是否恢复原剪贴板内容
 
 ## Ubuntu 快捷键配置

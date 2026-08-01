@@ -232,11 +232,115 @@ func main() {
 		defer logFile.Close()
 	}
 
-	sock := socketPath()
-	if sendStopIfRunning(sock) {
-		log.Println("Sent stop command to running instance")
+	testMode := len(os.Args) > 1 && os.Args[1] == "--test"
+
+	if !testMode {
+		sock := socketPath()
+		if sendStopIfRunning(sock) {
+			log.Println("Sent stop command to running instance")
+			return
+		}
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	log.Printf("Config file: %s", config.ConfigPath())
+	log.Printf("Engine: %s", cfg.API.Engine)
+	if cfg.API.Engine == "sherpa" {
+		log.Printf("Sherpa encoder: %s", cfg.Sherpa.Encoder)
+		log.Printf("Sherpa decoder: %s", cfg.Sherpa.Decoder)
+		log.Printf("Sherpa tokens: %s", cfg.Sherpa.Tokens)
+		log.Printf("Sherpa threads: %d", cfg.Sherpa.NumThreads)
+	} else {
+		if cfg.API.Key == "" {
+			fmt.Printf("请先配置 API Key，编辑配置文件: %s\n", config.ConfigPath())
+			os.Exit(1)
+		}
+		log.Printf("API base URL: %s", cfg.API.BaseURL)
+		log.Printf("API model: %s", cfg.API.Model)
+	}
+
+	if testMode {
+		runTestMode(cfg)
 		return
 	}
+
+	runNormalMode(cfg)
+}
+
+func runTestMode(cfg *config.Config) {
+	const testDuration = 3 * time.Second
+	testWavPath := filepath.Join(config.AppDir(), "test-temp.wav")
+
+	if err := audio.Init(); err != nil {
+		log.Fatalf("Failed to initialize audio: %v", err)
+	}
+	defer audio.Terminate()
+
+	recorder := audio.NewRecorder(cfg.Audio.SampleRate)
+
+	fmt.Println("[TEST] 开始录音，持续 3 秒...")
+	if err := recorder.Start(); err != nil {
+		log.Fatalf("Failed to start recording: %v", err)
+	}
+
+	var sherpaStream *api.SherpaStream
+	var sherpaRecognizer *api.SherpaStreamRecognizer
+	if cfg.API.Engine == "sherpa" {
+		var err error
+		sherpaRecognizer, err = api.NewSherpaStreamRecognizer(cfg.Sherpa)
+		if err != nil {
+			log.Fatalf("Failed to create sherpa recognizer: %v", err)
+		}
+		defer sherpaRecognizer.Close()
+
+		sherpaStream = sherpaRecognizer.CreateStream()
+		defer sherpaStream.Close()
+
+		go func() {
+			for samples := range recorder.AudioStream {
+				sherpaStream.FeedAudio(samples)
+			}
+		}()
+	}
+
+	time.Sleep(testDuration)
+	fmt.Println("[TEST] 录音结束")
+
+	if err := recorder.Stop(); err != nil {
+		log.Fatalf("Failed to stop recording: %v", err)
+	}
+
+	fmt.Printf("[TEST] 保存录音到: %s\n", testWavPath)
+	if err := recorder.SaveWAV(testWavPath); err != nil {
+		log.Fatalf("Failed to save WAV: %v", err)
+	}
+
+	fmt.Println("[TEST] 开始识别...")
+	var text string
+	if cfg.API.Engine == "sherpa" {
+		text = sherpaStream.Finish()
+	} else {
+		apiClient := api.NewClient(cfg.API.BaseURL, cfg.API.Key, cfg.API.Model)
+		var err error
+		text, err = apiClient.Transcribe(testWavPath)
+		if err != nil {
+			log.Fatalf("Transcription failed: %v", err)
+		}
+	}
+
+	if text == "" {
+		fmt.Println("[TEST] 识别结果: (空，未识别到内容)")
+	} else {
+		fmt.Printf("[TEST] 识别结果: %s\n", text)
+	}
+}
+
+func runNormalMode(cfg *config.Config) {
+	sock := socketPath()
 
 	listener, err := listenForStop(sock)
 	if err != nil {
@@ -247,16 +351,6 @@ func main() {
 		os.Remove(sock)
 	}()
 
-	cfg, err := config.Load()
-	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
-	}
-
-	if cfg.API.Key == "" {
-		fmt.Printf("请先配置 API Key，编辑配置文件: %s\n", config.ConfigPath())
-		os.Exit(1)
-	}
-
 	if err := audio.Init(); err != nil {
 		log.Fatalf("Failed to initialize audio: %v", err)
 	}
@@ -265,7 +359,6 @@ func main() {
 	targetWindow := input.GetActiveWindow()
 	log.Printf("Target window: %s", targetWindow)
 
-	apiClient := api.NewClient(cfg.API.BaseURL, cfg.API.Key, cfg.API.Model)
 	recorder := audio.NewRecorder(cfg.Audio.SampleRate)
 
 	log.Println("Recording started. Run the command again to stop.")
@@ -275,6 +368,31 @@ func main() {
 	}
 	notifyIf(cfg.Notifications.Start, "语音输入", "录音中", false)
 	start := time.Now()
+
+	// Start streaming recognition in background if using sherpa engine
+	var sherpaStream *api.SherpaStream
+	var sherpaRecognizer *api.SherpaStreamRecognizer
+	if cfg.API.Engine == "sherpa" {
+		sherpaRecognizer, err = api.NewSherpaStreamRecognizer(cfg.Sherpa)
+		if err != nil {
+			notifyFinalIf(cfg.Notifications.TranscribeFailed, "语音输入", "识别引擎初始化失败")
+			log.Fatalf("Failed to create sherpa recognizer: %v", err)
+		}
+		defer sherpaRecognizer.Close()
+
+		sherpaStream = sherpaRecognizer.CreateStream()
+		defer sherpaStream.Close()
+
+		go func() {
+			for samples := range recorder.AudioStream {
+				sherpaStream.FeedAudio(samples)
+				partialText := sherpaStream.GetPartialResult()
+				if partialText != "" && cfg.Notifications.Start {
+					notify("语音输入", "识别中: "+partialText, false)
+				}
+			}
+		}()
+	}
 
 	stopCh := make(chan struct{})
 	sigCh := make(chan os.Signal, 1)
@@ -316,21 +434,28 @@ func main() {
 		return
 	}
 
-	notifyIf(cfg.Notifications.Start, "语音输入", "识别中", false)
+	var text string
+	if cfg.API.Engine == "sherpa" {
+		log.Println("Finalizing streaming recognition...")
+		text = sherpaStream.Finish()
+	} else {
+		notifyIf(cfg.Notifications.Start, "语音输入", "识别中", false)
 
-	tmpFile := filepath.Join(os.TempDir(), "linux-voice-input.wav")
-	log.Println("Saving WAV...")
-	if err := recorder.SaveWAV(tmpFile); err != nil {
-		notifyFinalIf(cfg.Notifications.SaveFailed, "语音输入", "保存录音失败")
-		log.Fatalf("Failed to save WAV: %v", err)
-	}
-	defer os.Remove(tmpFile)
+		tmpFile := filepath.Join(os.TempDir(), "linux-voice-input.wav")
+		log.Println("Saving WAV...")
+		if err := recorder.SaveWAV(tmpFile); err != nil {
+			notifyFinalIf(cfg.Notifications.SaveFailed, "语音输入", "保存录音失败")
+			log.Fatalf("Failed to save WAV: %v", err)
+		}
+		defer os.Remove(tmpFile)
 
-	log.Println("Calling transcription API...")
-	text, err := apiClient.Transcribe(tmpFile)
-	if err != nil {
-		notifyFinalIf(cfg.Notifications.TranscribeFailed, "语音输入", "识别失败")
-		log.Fatalf("Transcription failed: %v", err)
+		log.Println("Calling transcription API...")
+		apiClient := api.NewClient(cfg.API.BaseURL, cfg.API.Key, cfg.API.Model)
+		text, err = apiClient.Transcribe(tmpFile)
+		if err != nil {
+			notifyFinalIf(cfg.Notifications.TranscribeFailed, "语音输入", "识别失败")
+			log.Fatalf("Transcription failed: %v", err)
+		}
 	}
 
 	if text == "" {
