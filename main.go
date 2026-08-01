@@ -112,6 +112,15 @@ func notifyFinalIf(enabled bool, summary, body string) {
 	closeCurrentNotificationLater()
 }
 
+func notifyPersistent(summary, body string) {
+	id, err := notifyDBusPersistent(summary, body, readNotifyID())
+	if err != nil {
+		log.Printf("dbus persistent notify failed: %v", err)
+		return
+	}
+	writeNotifyID(id)
+}
+
 func closeCurrentNotificationLater() {
 	id := readNotifyID()
 	if id != "0" {
@@ -131,6 +140,39 @@ func closeNotificationLater(id string) {
 }
 
 func notifyDBus(summary, body, replacesID string) (string, error) {
+	return notifyDBusWithTimeout(summary, body, replacesID, "3000")
+}
+
+func notifyDBusPersistent(summary, body, replacesID string) (string, error) {
+	out, err := exec.Command(
+		"gdbus", "call",
+		"--session",
+		"--dest", "org.freedesktop.Notifications",
+		"--object-path", "/org/freedesktop/Notifications",
+		"--method", "org.freedesktop.Notifications.Notify",
+		"Linux Voice Input",
+		replacesID,
+		"",
+		summary,
+		body,
+		"[]",
+		"{'urgency': <byte 2>, 'resident': <true>}",
+		"0",
+	).Output()
+	if err != nil {
+		return "", err
+	}
+
+	result := strings.TrimSpace(string(out))
+	id := strings.Trim(result, "(), ")
+	id = strings.TrimPrefix(id, "uint32 ")
+	if id == "" {
+		return "", fmt.Errorf("empty notification id from %q", result)
+	}
+	return id, nil
+}
+
+func notifyDBusWithTimeout(summary, body, replacesID, timeoutMs string) (string, error) {
 	out, err := exec.Command(
 		"gdbus", "call",
 		"--session",
@@ -144,7 +186,7 @@ func notifyDBus(summary, body, replacesID string) (string, error) {
 		body,
 		"[]",
 		"{'transient': <true>}",
-		"3000",
+		timeoutMs,
 	).Output()
 	if err != nil {
 		return "", err
@@ -388,7 +430,7 @@ func runNormalMode(cfg *config.Config) {
 				sherpaStream.FeedAudio(samples)
 				partialText := sherpaStream.GetPartialResult()
 				if partialText != "" && cfg.Notifications.Start {
-					notify("语音输入", "识别中: "+partialText, false)
+					notifyPersistent("语音输入", "录音中: "+partialText)
 				}
 			}
 		}()

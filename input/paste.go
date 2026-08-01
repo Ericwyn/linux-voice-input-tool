@@ -45,6 +45,11 @@ func PasteText(text string, restoreClipboard bool, targetWindow string) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 
+	// Explicitly release all modifier keys to avoid stuck keys
+	// when triggered via keyboard shortcut
+	exec.Command("xdotool", "keyup", "alt", "shift", "super", "ctrl", "Meta_L", "Meta_R").Run()
+	time.Sleep(50 * time.Millisecond)
+
 	if err := exec.Command("xdotool", "key", "--clearmodifiers", "ctrl+v").Run(); err != nil {
 		return fmt.Errorf("simulate paste: %w", err)
 	}
