@@ -3,9 +3,12 @@
 package doctor
 
 import (
+	"debug/elf"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 
 	"github.com/godbus/dbus/v5"
 
@@ -120,7 +123,13 @@ func checkEngine(cfg *config.Config) []Result {
 			Detail: "API Key 已配置"}}
 	}
 
-	// Local engines (sherpa / sensevoice): verify their model files exist.
+	// Local engines (sherpa / sensevoice) both link the sherpa-onnx C library
+	// and load model files. Check the native library first: without it the
+	// engine cannot run at all, so it is the more fundamental dependency and is
+	// reported ahead of the models.
+	var results []Result
+	results = append(results, checkSherpaLibrary())
+
 	label := "sherpa 模型"
 	if cfg.Engine == "sensevoice" {
 		label = "SenseVoice 模型"
@@ -128,12 +137,165 @@ func checkEngine(cfg *config.Config) []Result {
 	baseDir := cfg.ModelBaseDir()
 	missing := models.Check(baseDir, models.ForEngine(cfg.Engine))
 	if len(missing) == 0 {
-		return []Result{{Name: label, OK: true,
-			Detail: fmt.Sprintf("全部就绪（%s）", baseDir)}}
+		results = append(results, Result{Name: label, OK: true,
+			Detail: fmt.Sprintf("全部就绪（%s）", baseDir)})
+		return results
 	}
 	detail := fmt.Sprintf("缺失 %d 个文件（运行 --download-models 或在设置中下载）:", len(missing))
 	for _, item := range missing {
 		detail += fmt.Sprintf("\n    - %s: %s", item.Model, item.Path)
 	}
-	return []Result{{Name: label, OK: false, Detail: detail}}
+	results = append(results, Result{Name: label, OK: false, Detail: detail})
+	return results
+}
+
+// checkSherpaLibrary verifies that the sherpa-onnx native shared libraries the
+// local engines depend on can be resolved. Those libraries (libsherpa-onnx-c-api
+// and libonnxruntime) are linked as hard NEEDED dependencies of this binary via
+// CGO, with an rpath baked in at build time that points into the Go module
+// cache. It reads its own ELF dynamic section to discover exactly which
+// sherpa-onnx libraries are required and where the linker is told to find them,
+// then resolves each one the way the dynamic linker would. This gives users a
+// visible, resolved library path in the report and a clear diagnostic in the
+// edge cases where the library is unresolved (e.g. a binary copied to a machine
+// whose module-cache rpath no longer exists).
+func checkSherpaLibrary() Result {
+	const name = "sherpa-onnx 库"
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return Result{Name: name, OK: false,
+			Detail: fmt.Sprintf("无法定位当前可执行文件：%v", err)}
+	}
+
+	file, err := elf.Open(exePath)
+	if err != nil {
+		return Result{Name: name, OK: false,
+			Detail: fmt.Sprintf("无法解析可执行文件的动态段：%v", err)}
+	}
+	defer file.Close()
+
+	imported, err := file.ImportedLibraries()
+	if err != nil {
+		return Result{Name: name, OK: false,
+			Detail: fmt.Sprintf("无法读取动态依赖列表：%v", err)}
+	}
+
+	var neededSherpaLibs []string
+	for _, lib := range imported {
+		if strings.Contains(lib, "sherpa-onnx") || strings.Contains(lib, "onnxruntime") {
+			neededSherpaLibs = append(neededSherpaLibs, lib)
+		}
+	}
+	if len(neededSherpaLibs) == 0 {
+		return Result{Name: name, OK: false,
+			Detail: "本二进制未链接 sherpa-onnx 库，本地引擎无法运行（可能是使用了不含 CGO 的构建）"}
+	}
+
+	searchDirs := sharedLibrarySearchDirs(file, exePath)
+
+	var resolvedDirs []string
+	var unresolved []string
+	for _, lib := range neededSherpaLibs {
+		if dir := resolveSharedLibrary(lib, searchDirs); dir != "" {
+			resolvedDirs = appendUnique(resolvedDirs, dir)
+		} else {
+			unresolved = append(unresolved, lib)
+		}
+	}
+
+	if len(unresolved) > 0 {
+		detail := fmt.Sprintf("缺少 %d 个 sherpa-onnx 库，本地引擎（sherpa / sensevoice）无法运行：", len(unresolved))
+		for _, lib := range unresolved {
+			detail += fmt.Sprintf("\n    - %s", lib)
+		}
+		detail += "\n  请通过源码重新编译（go build 会自动引入该库），或改用 whisper 在线引擎。"
+		return Result{Name: name, OK: false, Detail: detail}
+	}
+
+	return Result{Name: name, OK: true,
+		Detail: fmt.Sprintf("全部就绪（%s）", strings.Join(resolvedDirs, ", "))}
+}
+
+// sharedLibrarySearchDirs returns the directories to search for a NEEDED shared
+// library. It reads the executable's DT_RPATH / DT_RUNPATH dynamic entries and
+// delegates the ordering and $ORIGIN expansion to composeSearchDirs (kept as a
+// separate pure function so the path logic is unit-testable without fabricating
+// an ELF).
+func sharedLibrarySearchDirs(file *elf.File, exePath string) []string {
+	runpaths, _ := file.DynString(elf.DT_RUNPATH)
+	rpaths, _ := file.DynString(elf.DT_RPATH)
+	return composeSearchDirs(runpaths, rpaths, filepath.Dir(exePath), os.Getenv("LD_LIBRARY_PATH"))
+}
+
+// composeSearchDirs builds the shared-library search directories in a pragmatic
+// approximation of the dynamic linker's own order: DT_RPATH (only honored when
+// no DT_RUNPATH is present), then LD_LIBRARY_PATH, then DT_RUNPATH, then the
+// common system library directories. Each rpath/runpath value may itself be a
+// colon-separated list, and $ORIGIN (or ${ORIGIN}) in an entry is expanded to
+// exeDir, matching the loader's behavior. ld.so.cache is not parsed; the
+// sherpa-onnx libraries live in the baked-in rpath, so the listed sources cover
+// the real cases.
+func composeSearchDirs(runpaths, rpaths []string, exeDir, ldLibraryPath string) []string {
+	expandOrigin := func(entry string) string {
+		return strings.ReplaceAll(strings.ReplaceAll(entry, "${ORIGIN}", exeDir), "$ORIGIN", exeDir)
+	}
+	splitEntries := func(value string) []string {
+		var dirs []string
+		for _, entry := range strings.Split(value, ":") {
+			entry = strings.TrimSpace(entry)
+			if entry != "" {
+				dirs = append(dirs, expandOrigin(entry))
+			}
+		}
+		return dirs
+	}
+
+	var dirs []string
+
+	// DT_RPATH is consulted only when DT_RUNPATH is absent.
+	if len(runpaths) == 0 {
+		for _, value := range rpaths {
+			dirs = append(dirs, splitEntries(value)...)
+		}
+	}
+
+	dirs = append(dirs, splitEntries(ldLibraryPath)...)
+
+	for _, value := range runpaths {
+		dirs = append(dirs, splitEntries(value)...)
+	}
+
+	dirs = append(dirs,
+		"/lib/x86_64-linux-gnu",
+		"/usr/lib/x86_64-linux-gnu",
+		"/lib",
+		"/usr/lib",
+		"/usr/local/lib",
+	)
+
+	return dirs
+}
+
+// resolveSharedLibrary returns the directory in which libName is found among the
+// given search directories, or an empty string if it is not present in any of
+// them.
+func resolveSharedLibrary(libName string, searchDirs []string) string {
+	for _, dir := range searchDirs {
+		candidate := filepath.Join(dir, libName)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return dir
+		}
+	}
+	return ""
+}
+
+// appendUnique appends value to slice only if it is not already present.
+func appendUnique(slice []string, value string) []string {
+	for _, existing := range slice {
+		if existing == value {
+			return slice
+		}
+	}
+	return append(slice, value)
 }

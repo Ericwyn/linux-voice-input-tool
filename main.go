@@ -225,6 +225,27 @@ func runDownloadModels(cfg *config.Config) {
 		fmt.Printf("下载失败: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Local engines also link the sherpa-onnx native shared libraries. Populate
+	// a `lib/` directory next to the binary so the whole directory becomes a
+	// portable, self-contained bundle (the binary is built with an $ORIGIN/lib
+	// rpath). Note: because those .so files are hard NEEDED dependencies loaded
+	// at startup, this cannot bootstrap a binary whose libraries are entirely
+	// missing (it would not have started); it makes an already-running dev build
+	// self-contained and repairs a partially populated lib dir.
+	libDir := config.RuntimeLibDir()
+	fmt.Printf("运行库目录: %s\n", libDir)
+	inProgress = false
+	if err := models.DownloadRuntimeLibrary(libDir, status, progress); err != nil {
+		if inProgress {
+			fmt.Println()
+		}
+		fmt.Printf("运行库下载失败: %v\n", err)
+		os.Exit(1)
+	}
+	if inProgress {
+		fmt.Println()
+	}
 }
 
 // runCheckConfig runs the doctor environment/configuration checks and prints a
@@ -296,7 +317,7 @@ func printUsage() {
   --record           触发录音开关：有守护进程则转发给它，否则独立运行一次
   --daemon           以常驻守护进程运行（系统托盘 + 全局热键 + 设置窗口）
   --test             测试模式：录音 3 秒并识别，用于验证配置是否正确
-  --download-models  下载当前引擎所需的模型（sherpa / sensevoice 引擎需要）
+  --download-models  下载当前引擎所需的模型与运行库（sherpa / sensevoice 引擎需要）
   --check-config     检查配置与环境依赖，并打印报告
   -v, --version      显示版本号
   -h, --help         显示本帮助信息（无参数时默认显示）

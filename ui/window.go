@@ -352,16 +352,32 @@ func (a *App) downloadModels(parent fyne.Window, engineName, baseDir string, sta
 				detailLabel.SetText(text)
 			})
 		}
-		err := models.DownloadMissing(baseDir, set, onStatus, onProgress)
-		fyne.Do(func() {
-			closeButton.Enable()
-			if err != nil {
+		if err := models.DownloadMissing(baseDir, set, onStatus, onProgress); err != nil {
+			fyne.Do(func() {
+				closeButton.Enable()
 				titleLabel.SetText("下载失败")
 				detailLabel.SetText(err.Error())
 				status.SetText("下载失败: " + err.Error())
+			})
+			return
+		}
+
+		// Local engines also need the sherpa-onnx shared libraries next to the
+		// binary (found via its $ORIGIN/lib rpath). Populate them right after
+		// the models so a single click yields a runnable local setup.
+		libDir := config.RuntimeLibDir()
+		fyne.Do(func() { progressBar.SetValue(0) })
+		errLib := models.DownloadRuntimeLibrary(libDir, onStatus, onProgress)
+
+		fyne.Do(func() {
+			closeButton.Enable()
+			if errLib != nil {
+				titleLabel.SetText("运行库下载失败")
+				detailLabel.SetText(errLib.Error())
+				status.SetText("运行库下载失败: " + errLib.Error())
 				return
 			}
-			titleLabel.SetText("全部模型就绪 ✓")
+			titleLabel.SetText("全部模型与运行库就绪 ✓")
 			progressBar.SetValue(1)
 			a.checkModels(engineName, baseDir, status)
 		})

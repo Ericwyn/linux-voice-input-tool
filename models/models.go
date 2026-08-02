@@ -257,33 +257,111 @@ func DownloadMissing(baseDir string, set []Model, status func(string), progress 
 	return nil
 }
 
+// RuntimeLibrary describes the sherpa-onnx native shared libraries the local
+// engines link against. Unlike models (data files loaded at runtime), these
+// .so files are hard NEEDED dependencies of the binary: the dynamic linker
+// loads them at process startup, so a binary shipped without them cannot start
+// at all. They are therefore normally bundled next to the binary (see
+// `make bundle`); this type also lets --download-models populate a local
+// `lib/` directory so a freshly built binary can be turned into a portable,
+// self-contained bundle.
+type RuntimeLibrary struct {
+	Label string
+	URL   string
+	// Files are the shared-library file names expected after install, matched
+	// by base name during extraction (the tarball nests them under an inner
+	// directory, which is flattened away).
+	Files []string
+}
+
+// sherpaRuntimeLibrary points at the official prebuilt shared-library bundle.
+// IMPORTANT: the version in the URL must match the sherpa-onnx-go-linux version
+// in go.mod (currently v1.13.4); the Go binding and the .so share one ABI, so a
+// mismatch can crash at load time. Update both together.
+var sherpaRuntimeLibrary = RuntimeLibrary{
+	Label: "sherpa-onnx 运行库",
+	URL:   "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-v1.13.4-linux-x64-shared-lib.tar.bz2",
+	Files: []string{
+		"libsherpa-onnx-c-api.so",
+		"libonnxruntime.so",
+		"libsherpa-onnx-cxx-api.so",
+	},
+}
+
+// RuntimeLibraryURL returns the download URL of the sherpa-onnx shared-library
+// bundle, exposed so build tooling (e.g. the Makefile's bundle target) can
+// share a single source of truth for the version.
+func RuntimeLibraryURL() string {
+	return sherpaRuntimeLibrary.URL
+}
+
+// RuntimeLibraryFiles returns the shared-library file names the local engines
+// require.
+func RuntimeLibraryFiles() []string {
+	return append([]string(nil), sherpaRuntimeLibrary.Files...)
+}
+
+// RuntimeLibrariesPresent reports whether all required sherpa-onnx shared
+// libraries already exist (non-empty) in libDir.
+func RuntimeLibrariesPresent(libDir string) bool {
+	for _, name := range sherpaRuntimeLibrary.Files {
+		path := filepath.Join(libDir, name)
+		if info, err := os.Stat(path); err != nil || info.Size() == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// DownloadRuntimeLibrary downloads the sherpa-onnx shared-library bundle and
+// extracts the required .so files (flattened by base name) into libDir. If the
+// libraries are already present it is a no-op. status/progress mirror
+// DownloadMissing's callbacks for CLI/UI reporting.
+func DownloadRuntimeLibrary(libDir string, status func(string), progress func(DownloadProgress)) error {
+	report := func(format string, args ...interface{}) {
+		if status != nil {
+			status(fmt.Sprintf(format, args...))
+		}
+	}
+
+	if RuntimeLibrariesPresent(libDir) {
+		report("已存在，跳过: %s（%s）", sherpaRuntimeLibrary.Label, libDir)
+		return nil
+	}
+
+	if err := os.MkdirAll(libDir, 0755); err != nil {
+		return fmt.Errorf("create lib dir: %w", err)
+	}
+
+	wanted := make(map[string]bool, len(sherpaRuntimeLibrary.Files))
+	for _, name := range sherpaRuntimeLibrary.Files {
+		wanted[name] = true
+	}
+
+	report("开始下载: %s", sherpaRuntimeLibrary.Label)
+	if err := downloadAndExtractFiles(sherpaRuntimeLibrary.URL, libDir, sherpaRuntimeLibrary.Label, wanted, progress); err != nil {
+		return fmt.Errorf("download %s: %w", sherpaRuntimeLibrary.Label, err)
+	}
+
+	if !RuntimeLibrariesPresent(libDir) {
+		return fmt.Errorf("下载后仍缺少运行库文件（%s）", libDir)
+	}
+	report("完成: %s（%s）", sherpaRuntimeLibrary.Label, libDir)
+	return nil
+}
+
 // downloadAndExtract streams a .tar.bz2 from url and extracts it into destDir.
 // When progress is non-nil, the compressed download stream is wrapped so speed
 // and percentage can be reported as bytes arrive, plus a final 100% report.
 func downloadAndExtract(url, destDir, label string, progress func(DownloadProgress)) error {
-	client := &http.Client{Timeout: 30 * time.Minute}
-	resp, err := client.Get(url)
+	resp, tracker, err := openDownloadStream(url, label, progress)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
-	}
-
 	var source io.Reader = resp.Body
-	var tracker *progressReader
-	if progress != nil {
-		now := time.Now()
-		tracker = &progressReader{
-			reader:         resp.Body,
-			total:          resp.ContentLength,
-			model:          label,
-			onProgress:     progress,
-			start:          now,
-			lastReportTime: now,
-		}
+	if tracker != nil {
 		source = tracker
 	}
 
@@ -320,22 +398,108 @@ func downloadAndExtract(url, destDir, label string, progress func(DownloadProgre
 		}
 	}
 
-	// Emit a final report so the display ends at the full downloaded size (and
-	// 100%), which the throttled per-read reports may have skipped.
-	if tracker != nil {
-		elapsed := time.Since(tracker.start).Seconds()
-		var avgSpeed float64
-		if elapsed > 0 {
-			avgSpeed = float64(tracker.downloaded) / elapsed
-		}
-		progress(DownloadProgress{
-			Model:       label,
-			Downloaded:  tracker.downloaded,
-			Total:       tracker.total,
-			BytesPerSec: avgSpeed,
-		})
-	}
+	reportFinalProgress(tracker, label, progress)
 	return nil
+}
+
+// downloadAndExtractFiles streams a .tar.bz2 from url and extracts only the
+// regular files whose base name is in wanted, flattening them directly into
+// destDir (the archive's inner directory structure is discarded). It is used
+// for the shared-library bundle, whose .so files live under an inner directory
+// but must land flat in the target lib directory. Progress reporting matches
+// downloadAndExtract.
+func downloadAndExtractFiles(url, destDir, label string, wanted map[string]bool, progress func(DownloadProgress)) error {
+	resp, tracker, err := openDownloadStream(url, label, progress)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var source io.Reader = resp.Body
+	if tracker != nil {
+		source = tracker
+	}
+
+	tarReader := tar.NewReader(bzip2.NewReader(source))
+	cleanDest := filepath.Clean(destDir)
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read tar: %w", err)
+		}
+
+		if header.Typeflag != tar.TypeReg {
+			continue
+		}
+		baseName := filepath.Base(header.Name)
+		if !wanted[baseName] {
+			continue
+		}
+
+		// Flatten: write by base name into destDir. baseName comes from
+		// filepath.Base so it cannot contain a path separator, ruling out
+		// traversal.
+		target := filepath.Join(cleanDest, baseName)
+		if err := writeFile(target, tarReader, os.FileMode(header.Mode)); err != nil {
+			return err
+		}
+	}
+
+	reportFinalProgress(tracker, label, progress)
+	return nil
+}
+
+// openDownloadStream performs the HTTP GET and, when progress is non-nil, wraps
+// the response body in a progressReader so byte-level speed/percentage can be
+// reported as the compressed stream arrives. The caller must close resp.Body.
+func openDownloadStream(url, label string, progress func(DownloadProgress)) (*http.Response, *progressReader, error) {
+	client := &http.Client{Timeout: 30 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, nil, fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
+	}
+
+	var tracker *progressReader
+	if progress != nil {
+		now := time.Now()
+		tracker = &progressReader{
+			reader:         resp.Body,
+			total:          resp.ContentLength,
+			model:          label,
+			onProgress:     progress,
+			start:          now,
+			lastReportTime: now,
+		}
+	}
+	return resp, tracker, nil
+}
+
+// reportFinalProgress emits a closing 100% progress report so the display ends
+// at the full downloaded size, which the throttled per-read reports may have
+// skipped. It is a no-op when progress/tracker are absent.
+func reportFinalProgress(tracker *progressReader, label string, progress func(DownloadProgress)) {
+	if tracker == nil || progress == nil {
+		return
+	}
+	elapsed := time.Since(tracker.start).Seconds()
+	var avgSpeed float64
+	if elapsed > 0 {
+		avgSpeed = float64(tracker.downloaded) / elapsed
+	}
+	progress(DownloadProgress{
+		Model:       label,
+		Downloaded:  tracker.downloaded,
+		Total:       tracker.total,
+		BytesPerSec: avgSpeed,
+	})
 }
 
 func writeFile(path string, src io.Reader, mode os.FileMode) error {

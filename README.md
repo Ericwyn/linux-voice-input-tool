@@ -118,15 +118,18 @@ make build        # 编译二进制到当前目录
 
 #### 安装到用户目录（可选）
 
-`make install` 会编译并把二进制、图标和桌面项安装到当前用户的 XDG 目录（无需 sudo）：
+`make install` 会编译、组装一个自包含目录（二进制 + 运行库），再调用分发包里的 `install.sh` 装到当前用户的 XDG 目录（无需 sudo）。本机安装与[分发到其他机器](#打包分发给其他机器自包含)走的是**同一套脚本**，行为一致：
 
 ```bash
 make install
 ```
 
-- 二进制 → `~/.local/bin/linux-voice-input`
+- 应用目录（二进制 + `lib/*.so`）→ `~/.local/share/linux-voice-input/`
+- 命令链接 → `~/.local/bin/linux-voice-input`（软链到上面的二进制）
 - 图标 → `~/.local/share/icons/hicolor/512x512/apps/linux-voice-input.png`
 - 桌面项 → `~/.local/share/applications/linux-voice-input.desktop`
+
+> 与直接把二进制丢进 `bin/` 不同，这里把二进制连同它的运行库 `.so` 一起装进独立的应用目录，再用软链接暴露到 `PATH`。这样即使之后清理了 Go 模块缓存（`go clean -modcache`），已安装的应用仍能正常启动。
 
 安装后可在应用菜单中搜索 “Linux Voice Input” 直接点击启动（以 `--daemon` 守护进程模式运行，自带托盘和全局热键）。若要卸载：
 
@@ -134,7 +137,69 @@ make install
 make uninstall
 ```
 
-> 想装到系统级路径可传入 `PREFIX`，例如 `sudo make install PREFIX=/usr/local`。若 `~/.local/bin` 不在 `PATH` 中，命令行调用请先将其加入 `PATH`。
+> 想装到系统级路径可传入 `PREFIX`，例如 `sudo make install PREFIX=/usr/local`（卸载需用相同的 `PREFIX`）。若 `~/.local/bin` 不在 `PATH` 中，命令行调用请先将其加入 `PATH`。
+
+#### 打包分发给其他机器（自包含）
+
+本地引擎依赖 sherpa-onnx 的 C 共享库（`libsherpa-onnx-c-api.so`、`libonnxruntime.so`）。在本机开发时，这些 `.so` 通过 Go 模块自动引入、由链接时写入的 rpath 指向模块缓存，因此 `go build` 出来的二进制直接可跑。但若把二进制单独拷到**没有 Go 环境**的其他机器，它会因找不到这些 `.so` 而无法启动。
+
+`make bundle` 会生成一个自包含、可直接拷走的目录（及对应压缩包），把二进制、所需 `.so`、图标以及安装脚本一起打包：
+
+```bash
+make bundle
+```
+
+产物：
+
+- 目录 `dist/linux-voice-input/`，含二进制、同级 `lib/*.so`、`icon.png`、`install.sh`、`uninstall.sh`
+- 压缩包 `dist/linux-voice-input-linux-x64.tar.gz`
+
+二进制在构建时额外写入了 `$ORIGIN/lib` 相对 rpath，因此会优先加载同目录下 `lib/` 里的 `.so`。把压缩包拷到任意 x86_64 Linux 机器上，**目标机器无需 Go、无需 make、无需系统级安装运行库**。
+
+**方式一：安装为本地应用（推荐）**
+
+解压后进入目录运行内置的 `install.sh`，它会把应用装到用户目录并在应用菜单中注册：
+
+```bash
+tar xzf linux-voice-input-linux-x64.tar.gz
+cd linux-voice-input
+./install.sh                              # 每用户安装到 ~/.local（无需 sudo）
+# 或系统级安装：
+sudo ./install.sh --prefix /usr/local
+```
+
+安装内容：
+
+- 应用目录（二进制 + `lib/`）→ `<prefix>/share/linux-voice-input/`
+- 命令链接 → `<prefix>/bin/linux-voice-input`（软链，`$ORIGIN` 按真实路径解析，仍能找到运行库）
+- 图标 → `<prefix>/share/icons/hicolor/512x512/apps/`
+- 桌面项 → `<prefix>/share/applications/`（用绝对路径以 `--daemon` 启动）
+
+安装后可在应用菜单搜索 “Linux Voice Input” 点击启动，或在终端运行 `linux-voice-input --daemon`。卸载运行同目录的 `./uninstall.sh`（与安装用相同的 `--prefix`），它保留 `~/.linux-voice-input` 下的配置与模型。
+
+**方式二：免安装，直接运行**
+
+```bash
+tar xzf linux-voice-input-linux-x64.tar.gz
+./linux-voice-input/linux-voice-input --daemon
+```
+
+> `make bundle` 里的 `.so` 直接取自 Go 模块缓存，与二进制链接的版本严格一致（版本由 `go.mod` 里的 `sherpa-onnx-go-linux` 决定），无需联网。
+
+#### 手动补齐运行库（缺 `.so` 时）
+
+如果一个二进制启动时报 `error while loading shared libraries: libsherpa-onnx-c-api.so: cannot open shared object file`，说明运行库缺失。有两种补法：
+
+- **让程序自动下载**：`./linux-voice-input --download-models` 在下载模型的同时，会把运行库下载并解压到二进制同目录的 `lib/`（前提是二进制本身还能启动，例如开发构建）。
+- **手动下载放置**：从官方 Release 下载对应版本的共享库包（版本需与 `go.mod` 中的 `sherpa-onnx-go-linux` 一致，当前为 v1.13.4），解压后把 `lib/` 下的 `.so` 放到二进制同目录的 `lib/` 里：
+
+```bash
+curl -fLO https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-v1.13.4-linux-x64-shared-lib.tar.bz2
+tar xjf sherpa-onnx-v1.13.4-linux-x64-shared-lib.tar.bz2
+mkdir -p lib && cp sherpa-onnx-v1.13.4-linux-x64-shared-lib/lib/*.so lib/
+```
+
+放好后运行 `./linux-voice-input --check-config`，「sherpa-onnx 库」一项应显示为就绪，并列出实际解析到的目录。
 
 ### 3. 下载模型
 
@@ -193,7 +258,7 @@ linux-voice-input [选项]
   --record           触发录音开关：有守护进程则转发给它，否则独立运行一次
   --daemon           以常驻守护进程运行（系统托盘 + 全局热键 + 设置窗口）
   --test             测试模式：录音 3 秒并识别，用于验证配置是否正确
-  --download-models  下载当前引擎所需的模型（sherpa / sensevoice 引擎需要）
+  --download-models  下载当前引擎所需的模型与运行库（sherpa / sensevoice 引擎需要）
   --check-config     检查配置与环境依赖，并打印报告
   -v, --version      显示版本号
   -h, --help         显示本帮助信息（无参数时默认显示）
@@ -201,7 +266,7 @@ linux-voice-input [选项]
 
 > 从 v0.1.0 起，无参数运行会显示帮助信息；触发录音请使用 `--record`（Ubuntu 快捷键也应绑定到 `--record`）。
 
-`--download-models` 输出示例：
+`--download-models` 输出示例（先下模型，再补运行库到二进制同目录的 `lib/`）：
 
 ```text
 模型目录: /home/user/.linux-voice-input/models
@@ -209,6 +274,10 @@ linux-voice-input [选项]
 下载中: 45.3/154.8 MB (29.3%) 3.2 MB/s
 完成: SenseVoice (识别+标点)
 全部模型就绪
+运行库目录: /path/to/lib
+开始下载: sherpa-onnx 运行库
+下载中: 9.1/9.1 MB (100.0%) 4.5 MB/s
+完成: sherpa-onnx 运行库（/path/to/lib）
 ```
 
 `--check-config` 输出示例：
@@ -220,6 +289,7 @@ linux-voice-input [选项]
   [✓] xdotool: /usr/bin/xdotool
   [✓] 桌面通知: D-Bus 通知服务可用
   [✓] 配置文件: /home/user/.linux-voice-input/config.yaml
+  [✓] sherpa-onnx 库: 全部就绪（/home/user/go/pkg/mod/github.com/k2-fsa/sherpa-onnx-go-linux@v1.13.4/lib/x86_64-unknown-linux-gnu）
   [✓] SenseVoice 模型: 全部就绪（/home/user/.linux-voice-input/models）
 
 全部检查通过。

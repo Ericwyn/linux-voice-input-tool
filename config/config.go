@@ -179,6 +179,20 @@ func AppDir() string {
 	return filepath.Join(home, ".linux-voice-input")
 }
 
+// RuntimeLibDir returns the directory in which the sherpa-onnx native shared
+// libraries should live for the binary to find them via its baked-in
+// $ORIGIN/lib rpath: a `lib` subdirectory next to the executable. It falls back
+// to a relative `lib` when the executable path cannot be determined. Both the
+// --download-models CLI path and the settings window use it so the library
+// lands where the loader looks.
+func RuntimeLibDir() string {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "lib"
+	}
+	return filepath.Join(filepath.Dir(exePath), "lib")
+}
+
 func ConfigPath() string {
 	return filepath.Join(AppDir(), "config.yaml")
 }
