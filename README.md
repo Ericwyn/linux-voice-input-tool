@@ -140,7 +140,7 @@ make uninstall
 ./linux-voice-input --download-models
 ```
 
-默认引擎为 sensevoice，只需下载一个模型（约 230 MB）。若切换到 sherpa 引擎，再次运行该命令会下载 sherpa 所需的三个模型。
+默认引擎为 sensevoice，只需下载一个模型（约 155 MB，为去掉冗余文件后重新打包的精简 int8 模型）。若切换到 sherpa 引擎，再次运行该命令会下载 sherpa 所需的三个模型。
 
 > whisper 引擎无需本地模型，运行该命令会提示「无需下载」。
 
@@ -186,7 +186,7 @@ linux-voice-input [选项]
 ```text
 模型目录: /home/user/.linux-voice-input/models
 开始下载: SenseVoice (识别+标点)
-下载中: 45.3/230.1 MB (19.7%) 3.2 MB/s
+下载中: 45.3/154.8 MB (29.3%) 3.2 MB/s
 完成: SenseVoice (识别+标点)
 全部模型就绪
 ```

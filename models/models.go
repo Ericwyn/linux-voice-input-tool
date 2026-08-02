@@ -56,7 +56,12 @@ var senseVoiceModels = []Model{
 	{
 		Label: "SenseVoice (识别+标点)",
 		Dir:   "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
-		URL:   "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+		// Slimmed repackage of the official k2-fsa bundle: only the int8 model
+		// and tokens this engine actually loads, dropping the unused 895 MB
+		// fp32 model.onnx and test files, cutting the download from ~700 MB to
+		// ~155 MB. Same archive format and inner directory as upstream, so the
+		// extractor and SenseVoicePathsFor are unaffected.
+		URL:   "https://github.com/Ericwyn/linux-voice-input-tool/releases/download/sensevoice-int8-min/sensevoice-int8-min.tar.bz2",
 		Files: []string{"model.int8.onnx", "tokens.txt"},
 	},
 }
