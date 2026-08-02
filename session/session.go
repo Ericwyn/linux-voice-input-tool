@@ -28,8 +28,8 @@ const minRecordingDuration = time.Second
 const toggleDebounce = 400 * time.Millisecond
 
 // previewNotifyInterval is the minimum gap between live preview notifications
-// during recording. Each notification spawns a gdbus process, so updating on
-// every audio frame would overwhelm the session bus.
+// during recording. Each notification is a D-Bus call to the notification
+// server, so updating on every audio frame would overwhelm the session bus.
 const previewNotifyInterval = 300 * time.Millisecond
 
 // Controller owns the recording lifecycle and drives the recognition engine.
@@ -221,10 +221,10 @@ func (c *Controller) startFeedLoop(recorder *audio.Recorder, session engine.Sess
 
 	go func() {
 		defer close(done)
-		// Throttle preview notifications: each notify.Persistent spawns a gdbus
-		// process, so firing it on every ~64ms audio frame would swamp the
-		// session bus. Only update when the text changed and at most every
-		// previewNotifyInterval.
+		// Throttle preview notifications: each notify.Persistent is a D-Bus call
+		// to the notification server, so firing it on every ~64ms audio frame
+		// would swamp the session bus. Only update when the text changed and at
+		// most every previewNotifyInterval.
 		var lastPreview string
 		var lastNotifyTime time.Time
 		for samples := range audioStream {
@@ -268,6 +268,14 @@ func (c *Controller) StopAndTranscribe() {
 	c.mu.Unlock()
 
 	go c.notifyStateChange(false)
+
+	// Finally-style guarantee: whichever path ends this recording — success,
+	// any error return, or even a panic — the resident (never-expiring) live
+	// preview bubble is torn down so it can never linger on screen. It is a
+	// no-op once a result/error notification has already replaced the preview,
+	// so it only fires when nothing else closed it (notably the silent success
+	// path below, which shows no result notification of its own).
+	defer notify.EndPreview()
 
 	defer func() {
 		if activeSession != nil {
@@ -314,7 +322,10 @@ func (c *Controller) StopAndTranscribe() {
 		return
 	}
 
-	notify.FinalIf(c.cfg.Notifications.Success, "语音输入", "已输入："+text)
+	// On success the preview already showed the text and it is now in the input
+	// box, so tear the preview down silently; engines without a preview still
+	// get a confirmation notification when enabled.
+	notify.FinalSuccess(c.cfg.Notifications.Success, "语音输入", "已输入："+text)
 	log.Println("Done")
 }
 

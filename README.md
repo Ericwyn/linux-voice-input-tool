@@ -79,9 +79,7 @@ Ubuntu / Debian：
 sudo apt install -y \
   portaudio19-dev \
   xclip \
-  xdotool \
-  libnotify-bin \
-  libglib2.0-bin
+  xdotool
 ```
 
 | 依赖 | 用途 |
@@ -89,8 +87,12 @@ sudo apt install -y \
 | `portaudio19-dev` | 麦克风录音（编译时需要） |
 | `xclip` | 写入 X11 剪贴板 |
 | `xdotool` | 获取 / 激活窗口并模拟 `Ctrl+V` |
-| `libnotify-bin` | 提供 `notify-send` 桌面通知 fallback |
-| `libglib2.0-bin` | 提供 `gdbus`，用于更新和关闭同一条通知 |
+
+桌面通知直接通过会话总线的 freedesktop `org.freedesktop.Notifications` D-Bus 接口发送，无需 `gdbus`，兼容 GNOME / KDE / XFCE / dunst 等任意符合规范的通知服务。若会话总线不可用，会退化到 `notify-send`（来自 `libnotify-bin`）作为可选兜底，需要时再安装即可：
+
+```bash
+sudo apt install -y libnotify-bin
+```
 
 > 当前优先支持 **X11**。Wayland 下 `xclip` / `xdotool` 可能不可用，建议使用 X11 会话。
 
@@ -196,7 +198,7 @@ linux-voice-input [选项]
   [✓] 显示服务器: X11
   [✓] xclip: /usr/bin/xclip
   [✓] xdotool: /usr/bin/xdotool
-  [✓] 桌面通知: gdbus/notify-send 可用
+  [✓] 桌面通知: D-Bus 通知服务可用
   [✓] 配置文件: /home/user/.linux-voice-input/config.yaml
   [✓] SenseVoice 模型: 全部就绪（/home/user/.linux-voice-input/models）
 

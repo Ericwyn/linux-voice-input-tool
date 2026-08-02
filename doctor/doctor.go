@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 
+	"github.com/godbus/dbus/v5"
+
 	"linux-voice-input/config"
 	"linux-voice-input/models"
 )
@@ -72,18 +74,31 @@ func checkCommands() []Result {
 		}
 	}
 
-	// Notifications need at least one of gdbus or notify-send.
-	_, gdbusErr := exec.LookPath("gdbus")
-	_, notifyErr := exec.LookPath("notify-send")
-	if gdbusErr == nil || notifyErr == nil {
-		results = append(results, Result{Name: "桌面通知", OK: true,
-			Detail: "gdbus/notify-send 可用"})
-	} else {
-		results = append(results, Result{Name: "桌面通知", OK: false,
-			Detail: "gdbus 和 notify-send 均未找到；通知将不可用"})
-	}
+	results = append(results, checkNotificationService())
 
 	return results
+}
+
+// checkNotificationService probes the session bus for a running
+// org.freedesktop.Notifications server. Notifications are now spoken directly
+// over D-Bus (no gdbus / notify-send binary required), so the meaningful check
+// is whether a spec-compliant notification server is actually available.
+func checkNotificationService() Result {
+	conn, err := dbus.SessionBus()
+	if err != nil {
+		return Result{Name: "桌面通知", OK: false,
+			Detail: fmt.Sprintf("无法连接会话 D-Bus：%v", err)}
+	}
+
+	var owner string
+	call := conn.BusObject().Call("org.freedesktop.DBus.GetNameOwner", 0,
+		"org.freedesktop.Notifications")
+	if call.Err != nil || call.Store(&owner) != nil || owner == "" {
+		return Result{Name: "桌面通知", OK: false,
+			Detail: "未检测到通知服务（org.freedesktop.Notifications）；请确认桌面通知守护进程正在运行"}
+	}
+	return Result{Name: "桌面通知", OK: true,
+		Detail: "D-Bus 通知服务可用"}
 }
 
 func checkConfigFile() Result {
