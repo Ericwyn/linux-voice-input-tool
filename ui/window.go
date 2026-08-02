@@ -21,12 +21,16 @@ import (
 type settingsForm struct {
 	engineSelect *widget.Select
 
-	// sherpa fields: a single model directory drives all six model paths.
+	// Local-engine fields. A single model directory is shared by both local
+	// engines (sherpa and sensevoice).
 	modelDir    *widget.Entry
 	modelStatus *widget.Label
-	numThreads  *widget.Entry
-	rule1       *widget.Entry
-	rule2       *widget.Entry
+	// sherpa-specific tuning
+	numThreads *widget.Entry
+	rule1      *widget.Entry
+	rule2      *widget.Entry
+	// sensevoice-specific tuning
+	previewInterval *widget.Entry
 
 	// whisper fields
 	apiKey  *widget.Entry
@@ -67,15 +71,16 @@ func (a *App) buildSettingsContent(window fyne.Window, form *settingsForm) fyne.
 	cfg := a.controller.Config()
 
 	// --- Engine selector ---
-	form.engineSelect = widget.NewSelect([]string{"sherpa", "whisper"}, nil)
-	form.engineSelect.SetSelected(cfg.API.Engine)
+	form.engineSelect = widget.NewSelect([]string{"sensevoice", "sherpa", "whisper"}, nil)
+	form.engineSelect.SetSelected(cfg.Engine)
 
 	engineForm := widget.NewForm(
 		hintedItem("识别引擎", form.engineSelect,
-			"sherpa = 本地离线识别（推荐，无需联网）；whisper = 在线 API 识别（需网络和密钥）"),
+			"sensevoice = 本地单模型识别（推荐，识别+标点一体，最省内存）；sherpa = 本地三模型识别；whisper = 在线 API 识别（需网络和密钥）"),
 	)
 
-	// --- Sherpa group: single model directory + check/download ---
+	// --- Local model group: single model directory + check/download, shared
+	// by both local engines (sherpa and sensevoice). ---
 	baseDir := cfg.Sherpa.ModelDir
 	if baseDir == "" {
 		baseDir = config.DefaultModelDir()
@@ -96,13 +101,26 @@ func (a *App) buildSettingsContent(window fyne.Window, form *settingsForm) fyne.
 	form.modelStatus = widget.NewLabel("")
 	form.modelStatus.Wrapping = fyne.TextWrapWord
 
+	// Check/download operate on the currently selected engine's model set, so
+	// switching the dropdown (before saving) targets the right bundles.
 	checkButton := widget.NewButton("检查模型", func() {
-		a.checkModels(form.modelDir.Text, form.modelStatus)
+		a.checkModels(form.engineSelect.Selected, form.modelDir.Text, form.modelStatus)
 	})
 	downloadButton := widget.NewButton("下载缺失模型", func() {
-		a.downloadModels(window, form.modelDir.Text, form.modelStatus, form)
+		a.downloadModels(window, form.engineSelect.Selected, form.modelDir.Text, form.modelStatus)
 	})
 
+	modelDirForm := widget.NewForm(
+		hintedItem("模型目录", modelDirRow,
+			"存放语音识别模型的文件夹。若缺失，点下方“下载缺失模型”自动获取"),
+	)
+	localModelGroup := container.NewVBox(
+		modelDirForm,
+		container.NewHBox(checkButton, downloadButton),
+		form.modelStatus,
+	)
+
+	// --- Sherpa-specific tuning ---
 	form.numThreads = widget.NewEntry()
 	form.numThreads.SetText(strconv.Itoa(cfg.Sherpa.NumThreads))
 	form.rule1 = widget.NewEntry()
@@ -110,9 +128,7 @@ func (a *App) buildSettingsContent(window fyne.Window, form *settingsForm) fyne.
 	form.rule2 = widget.NewEntry()
 	form.rule2.SetText(strconv.FormatFloat(float64(cfg.Sherpa.Rule2MinTrailingSilence), 'f', -1, 32))
 
-	sherpaForm := widget.NewForm(
-		hintedItem("模型目录", modelDirRow,
-			"存放语音识别模型的文件夹。若缺失，点下方“下载缺失模型”自动获取"),
+	sherpaTuning := widget.NewForm(
 		hintedItem("推理线程数", form.numThreads,
 			"识别时占用的 CPU 线程数，越大越快但更耗电，一般填 4"),
 		hintedItem("长停顿断句 (秒)", form.rule1,
@@ -120,19 +136,23 @@ func (a *App) buildSettingsContent(window fyne.Window, form *settingsForm) fyne.
 		hintedItem("短停顿断句 (秒)", form.rule2,
 			"较短停顿的断句阈值，默认 1.2；一般保持默认即可"),
 	)
-	sherpaGroup := container.NewVBox(
-		sherpaForm,
-		container.NewHBox(checkButton, downloadButton),
-		form.modelStatus,
+
+	// --- SenseVoice-specific tuning ---
+	form.previewInterval = widget.NewEntry()
+	form.previewInterval.SetText(strconv.Itoa(cfg.SenseVoice.PreviewIntervalMs))
+
+	senseVoiceTuning := widget.NewForm(
+		hintedItem("实时预览间隔 (毫秒)", form.previewInterval,
+			"录音时每隔这么久重新识别一次做预览，默认 1000；填 0 则关闭预览、仅在停止后识别一次"),
 	)
 
 	// --- Whisper group ---
 	form.apiKey = widget.NewPasswordEntry()
-	form.apiKey.SetText(cfg.API.Key)
+	form.apiKey.SetText(cfg.Whisper.Key)
 	form.baseURL = widget.NewEntry()
-	form.baseURL.SetText(cfg.API.BaseURL)
+	form.baseURL.SetText(cfg.Whisper.BaseURL)
 	form.model = widget.NewEntry()
-	form.model.SetText(cfg.API.Model)
+	form.model.SetText(cfg.Whisper.Model)
 
 	whisperGroup := widget.NewForm(
 		hintedItem("API Key", form.apiKey,
@@ -143,18 +163,30 @@ func (a *App) buildSettingsContent(window fyne.Window, form *settingsForm) fyne.
 			"在线识别使用的模型，一般保持默认"),
 	)
 
-	// Engine switch toggles which group is visible.
+	// Engine switch toggles which groups are visible. Both local engines share
+	// the model directory group; each shows only its own tuning group; whisper
+	// hides all local groups and shows the API group.
 	updateEngineVisibility := func(engine string) {
-		if engine == "whisper" {
-			sherpaGroup.Hide()
+		switch engine {
+		case "whisper":
+			localModelGroup.Hide()
+			sherpaTuning.Hide()
+			senseVoiceTuning.Hide()
 			whisperGroup.Show()
-		} else {
+		case "sensevoice":
 			whisperGroup.Hide()
-			sherpaGroup.Show()
+			sherpaTuning.Hide()
+			localModelGroup.Show()
+			senseVoiceTuning.Show()
+		default: // sherpa
+			whisperGroup.Hide()
+			senseVoiceTuning.Hide()
+			localModelGroup.Show()
+			sherpaTuning.Show()
 		}
 	}
 	form.engineSelect.OnChanged = updateEngineVisibility
-	updateEngineVisibility(cfg.API.Engine)
+	updateEngineVisibility(cfg.Engine)
 
 	// --- Common group ---
 	form.sampleRate = widget.NewEntry()
@@ -207,7 +239,9 @@ func (a *App) buildSettingsContent(window fyne.Window, form *settingsForm) fyne.
 	body := container.NewVBox(
 		widget.NewLabelWithStyle("识别引擎", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		engineForm,
-		sherpaGroup,
+		localModelGroup,
+		sherpaTuning,
+		senseVoiceTuning,
 		whisperGroup,
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("通用", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
@@ -220,9 +254,10 @@ func (a *App) buildSettingsContent(window fyne.Window, form *settingsForm) fyne.
 	return container.NewBorder(nil, buttons, nil, nil, scroll)
 }
 
-// checkModels inspects the model directory and reports which files are missing.
-func (a *App) checkModels(baseDir string, status *widget.Label) {
-	missing := models.Check(baseDir)
+// checkModels inspects the model directory and reports which files are missing
+// for the given engine's model set. Engines with no local models report ready.
+func (a *App) checkModels(engineName, baseDir string, status *widget.Label) {
+	missing := models.Check(baseDir, models.ForEngine(engineName))
 	if len(missing) == 0 {
 		status.SetText("全部模型已就绪 ✓")
 		return
@@ -234,27 +269,34 @@ func (a *App) checkModels(baseDir string, status *widget.Label) {
 	status.SetText(text)
 }
 
-// downloadModels downloads and extracts any missing model bundles into baseDir,
-// updating the status label with progress. It runs off the UI goroutine.
-func (a *App) downloadModels(window fyne.Window, baseDir string, status *widget.Label, form *settingsForm) {
+// downloadModels downloads and extracts any missing bundles for the given
+// engine's model set into baseDir, updating the status label with progress. It
+// runs off the UI goroutine.
+func (a *App) downloadModels(window fyne.Window, engineName, baseDir string, status *widget.Label) {
 	if baseDir == "" {
 		dialog.ShowError(fmt.Errorf("请先填写模型目录"), window)
 		return
 	}
 
+	set := models.ForEngine(engineName)
 	fyne.Do(func() { status.SetText("准备下载…") })
 
 	go func() {
-		err := models.DownloadMissing(baseDir, func(msg string) {
+		onStatus := func(msg string) {
 			fyne.Do(func() { status.SetText(msg) })
-		})
+		}
+		onProgress := func(p models.DownloadProgress) {
+			text := p.String()
+			fyne.Do(func() { status.SetText(text) })
+		}
+		err := models.DownloadMissing(baseDir, set, onStatus, onProgress)
 		fyne.Do(func() {
 			if err != nil {
 				status.SetText("下载失败: " + err.Error())
 				dialog.ShowError(err, window)
 				return
 			}
-			a.checkModels(baseDir, status)
+			a.checkModels(engineName, baseDir, status)
 		})
 	}()
 }
@@ -293,7 +335,7 @@ func (a *App) saveSettings(form *settingsForm) error {
 	cfg := a.controller.Config()
 	newCfg := *cfg // shallow copy; nested structs are value types
 
-	newCfg.API.Engine = form.engineSelect.Selected
+	newCfg.Engine = form.engineSelect.Selected
 
 	// The single model directory is the source of truth; derive the six paths.
 	newCfg.Sherpa.ModelDir = form.modelDir.Text
@@ -309,9 +351,16 @@ func (a *App) saveSettings(form *settingsForm) error {
 		newCfg.Sherpa.Rule2MinTrailingSilence = float32(rule2)
 	}
 
-	newCfg.API.Key = form.apiKey.Text
-	newCfg.API.BaseURL = form.baseURL.Text
-	newCfg.API.Model = form.model.Text
+	// SenseVoice shares the same model directory as sherpa; ResolveModelPaths
+	// above already derived its file paths from it. Only the preview interval is
+	// engine-specific here. A non-numeric entry leaves the previous value.
+	if previewMs, err := strconv.Atoi(form.previewInterval.Text); err == nil && previewMs >= 0 {
+		newCfg.SenseVoice.PreviewIntervalMs = previewMs
+	}
+
+	newCfg.Whisper.Key = form.apiKey.Text
+	newCfg.Whisper.BaseURL = form.baseURL.Text
+	newCfg.Whisper.Model = form.model.Text
 
 	if rate, err := strconv.Atoi(form.sampleRate.Text); err == nil && rate > 0 {
 		newCfg.Audio.SampleRate = rate
@@ -330,7 +379,7 @@ func (a *App) saveSettings(form *settingsForm) error {
 	newCfg.Notifications.EmptyResult = form.notifChecks["结果为空"].Checked
 	newCfg.Notifications.PasteFailed = form.notifChecks["粘贴失败"].Checked
 
-	log.Printf("Saving settings: engine=%s modelDir=%s hotkey=%s enabled=%v", newCfg.API.Engine, newCfg.Sherpa.ModelDir, newCfg.Hotkey, newCfg.HotkeyEnabled)
+	log.Printf("Saving settings: engine=%s modelDir=%s hotkey=%s enabled=%v", newCfg.Engine, newCfg.Sherpa.ModelDir, newCfg.Hotkey, newCfg.HotkeyEnabled)
 	return a.applySavedConfig(&newCfg)
 }
 
@@ -350,8 +399,13 @@ func (a *App) runDoctorCheck(window fyne.Window) {
 
 	report := widget.NewLabel(builder.String())
 	report.Wrapping = fyne.TextWrapWord
-	dialog.ShowCustom("环境检查", "关闭",
-		container.NewVScroll(report), window)
+
+	// Without a min size the scroll container collapses and ShowCustom sizes the
+	// dialog to that tiny content. Fix the scroll area to a comfortable size so
+	// the full multi-line report is readable without manual resizing.
+	scroll := container.NewVScroll(report)
+	scroll.SetMinSize(fyne.NewSize(640, 480))
+	dialog.ShowCustom("环境检查", "关闭", scroll, window)
 }
 
 // hintedItem builds a form item that lays the label to the left of the control

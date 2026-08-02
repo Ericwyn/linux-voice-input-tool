@@ -9,8 +9,21 @@ import (
 	"linux-voice-input/models"
 )
 
-type APIConfig struct {
-	Engine  string `yaml:"engine"` // "whisper" (online) or "sherpa" (local streaming)
+// WhisperConfig holds the settings for the online whisper engine (SiliconFlow).
+// It is one engine block among the peers (sherpa / sensevoice), symmetric with
+// them; the global engine selector lives at the config root, not here.
+type WhisperConfig struct {
+	Key     string `yaml:"key"`
+	BaseURL string `yaml:"base_url"`
+	Model   string `yaml:"model"`
+}
+
+// legacyAPIBlock captures the pre-migration top-level `api:` block, which mixed
+// the global engine selector with whisper's own fields. Load reads it only to
+// migrate old configs into the new engine/whisper layout, then clears it so it
+// is never written back.
+type legacyAPIBlock struct {
+	Engine  string `yaml:"engine"`
 	Key     string `yaml:"key"`
 	BaseURL string `yaml:"base_url"`
 	Model   string `yaml:"model"`
@@ -32,6 +45,31 @@ type SherpaConfig struct {
 	PunctModel              string  `yaml:"punct_model"`
 }
 
+// SenseVoiceConfig configures the local SenseVoice engine: one non-streaming
+// model that produces ASR text with punctuation (via inverse text
+// normalization) in a single pass.
+type SenseVoiceConfig struct {
+	// ModelDir is the base directory holding the SenseVoice bundle. When empty
+	// it falls back to SherpaConfig.ModelDir (both engines share one models
+	// directory by default). Model and Tokens are derived from it.
+	ModelDir string `yaml:"model_dir"`
+	Model    string `yaml:"model"`
+	Tokens   string `yaml:"tokens"`
+
+	// Language is the recognition language: auto/zh/en/yue/ja/ko. "auto" lets
+	// the model detect among Chinese/Cantonese/English/Japanese/Korean.
+	Language string `yaml:"language"`
+	// UseITN enables inverse text normalization, which also yields punctuation.
+	UseITN     bool `yaml:"use_itn"`
+	NumThreads int  `yaml:"num_threads"`
+
+	// PreviewIntervalMs is the period, in milliseconds, at which the accumulated
+	// audio is re-recognized to produce a live preview. A value > 0 enables the
+	// pseudo-streaming preview; <= 0 disables it (recognition then runs only
+	// once when recording stops).
+	PreviewIntervalMs int `yaml:"preview_interval_ms"`
+}
+
 type AudioConfig struct {
 	SampleRate int `yaml:"sample_rate"`
 }
@@ -49,8 +87,15 @@ type NotificationsConfig struct {
 }
 
 type Config struct {
-	API              APIConfig           `yaml:"api"`
-	Sherpa           SherpaConfig        `yaml:"sherpa"`
+	// Engine is the global recognition engine selector: "sensevoice", "sherpa",
+	// or "whisper". It lives at the root because it chooses among the engine
+	// blocks below rather than belonging to any one of them.
+	Engine string `yaml:"engine"`
+
+	Sherpa     SherpaConfig     `yaml:"sherpa"`
+	SenseVoice SenseVoiceConfig `yaml:"sensevoice"`
+	Whisper    WhisperConfig    `yaml:"whisper"`
+
 	Audio            AudioConfig         `yaml:"audio"`
 	Notifications    NotificationsConfig `yaml:"notifications"`
 	RestoreClipboard bool                `yaml:"restore_clipboard"`
@@ -75,9 +120,12 @@ func DefaultModelDir() string {
 func DefaultConfig() *Config {
 	baseDir := DefaultModelDir()
 	paths := models.Paths(baseDir)
+	sensePaths := models.SenseVoicePathsFor(baseDir)
 	return &Config{
-		API: APIConfig{
-			Engine:  "sherpa",
+		// Default to the local SenseVoice engine: a single non-streaming model
+		// covering ASR plus punctuation, the lightest local option.
+		Engine: "sensevoice",
+		Whisper: WhisperConfig{
 			Key:     "",
 			BaseURL: "https://api.siliconflow.cn/v1",
 			Model:   "FunAudioLLM/SenseVoiceSmall",
@@ -93,6 +141,15 @@ func DefaultConfig() *Config {
 			OfflineModel:            paths.OfflineModel,
 			OfflineTokens:           paths.OfflineTokens,
 			PunctModel:              paths.PunctModel,
+		},
+		SenseVoice: SenseVoiceConfig{
+			ModelDir:          baseDir,
+			Model:             sensePaths.Model,
+			Tokens:            sensePaths.Tokens,
+			Language:          "auto",
+			UseITN:            true,
+			NumThreads:        4,
+			PreviewIntervalMs: 1000,
 		},
 		Audio: AudioConfig{
 			SampleRate: 16000,
@@ -134,21 +191,75 @@ func legacyConfigPath() string {
 	return filepath.Join(home, ".config", "linux-voice-input", "config.yaml")
 }
 
-// ResolveModelPaths derives the six sherpa file paths from ModelDir when it is
-// set, making the single directory the source of truth. Explicit per-file
-// paths in the config are overridden. If ModelDir is empty (e.g. a legacy
-// config), the existing explicit paths are kept as-is.
+// ResolveModelPaths derives the concrete model file paths from the configured
+// model directories, making the single directory the source of truth. Explicit
+// per-file paths in the config are overridden. Sherpa paths derive from
+// Sherpa.ModelDir; SenseVoice paths derive from SenseVoice.ModelDir, falling
+// back to Sherpa.ModelDir when the former is empty (both engines share one
+// models directory by default). If a base directory is empty (e.g. a legacy
+// config), the corresponding explicit paths are kept as-is.
 func (c *Config) ResolveModelPaths() {
-	if c.Sherpa.ModelDir == "" {
-		return
+	if c.Sherpa.ModelDir != "" {
+		paths := models.Paths(c.Sherpa.ModelDir)
+		c.Sherpa.Encoder = paths.Encoder
+		c.Sherpa.Decoder = paths.Decoder
+		c.Sherpa.Tokens = paths.Tokens
+		c.Sherpa.OfflineModel = paths.OfflineModel
+		c.Sherpa.OfflineTokens = paths.OfflineTokens
+		c.Sherpa.PunctModel = paths.PunctModel
 	}
-	paths := models.Paths(c.Sherpa.ModelDir)
-	c.Sherpa.Encoder = paths.Encoder
-	c.Sherpa.Decoder = paths.Decoder
-	c.Sherpa.Tokens = paths.Tokens
-	c.Sherpa.OfflineModel = paths.OfflineModel
-	c.Sherpa.OfflineTokens = paths.OfflineTokens
-	c.Sherpa.PunctModel = paths.PunctModel
+
+	senseDir := c.SenseVoice.ModelDir
+	if senseDir == "" {
+		senseDir = c.Sherpa.ModelDir
+	}
+	if senseDir != "" {
+		sensePaths := models.SenseVoicePathsFor(senseDir)
+		c.SenseVoice.ModelDir = senseDir
+		c.SenseVoice.Model = sensePaths.Model
+		c.SenseVoice.Tokens = sensePaths.Tokens
+	}
+}
+
+// ModelBaseDir returns the base directory holding the configured engine's local
+// models. SenseVoice uses its own ModelDir when set, otherwise both local
+// engines share the sherpa models directory; a final fallback is the default.
+func (c *Config) ModelBaseDir() string {
+	if c.Engine == "sensevoice" && c.SenseVoice.ModelDir != "" {
+		return c.SenseVoice.ModelDir
+	}
+	if c.Sherpa.ModelDir != "" {
+		return c.Sherpa.ModelDir
+	}
+	return DefaultModelDir()
+}
+
+// migrateLegacyAPI detects the pre-migration top-level `api:` block in raw and,
+// if present, folds its values into the new engine/whisper layout on cfg: the
+// engine selector moves to the root, and the whisper-specific fields move into
+// the whisper block. It only overrides fields the old block actually set, so
+// defaults survive. It returns true when a legacy block was found, signaling the
+// caller to rewrite the file in the new format (which no longer has `api:`).
+func migrateLegacyAPI(raw []byte, cfg *Config) bool {
+	var probe struct {
+		API *legacyAPIBlock `yaml:"api"`
+	}
+	if err := yaml.Unmarshal(raw, &probe); err != nil || probe.API == nil {
+		return false
+	}
+	if probe.API.Engine != "" {
+		cfg.Engine = probe.API.Engine
+	}
+	if probe.API.Key != "" {
+		cfg.Whisper.Key = probe.API.Key
+	}
+	if probe.API.BaseURL != "" {
+		cfg.Whisper.BaseURL = probe.API.BaseURL
+	}
+	if probe.API.Model != "" {
+		cfg.Whisper.Model = probe.API.Model
+	}
+	return true
 }
 
 func Load() (*Config, error) {
@@ -159,7 +270,15 @@ func Load() (*Config, error) {
 		if err := yaml.Unmarshal(data, cfg); err != nil {
 			return nil, err
 		}
+		migrated := migrateLegacyAPI(data, cfg)
 		cfg.ResolveModelPaths()
+		// Rewrite the file when we upgraded an old `api:` block, so the new
+		// engine/whisper layout is persisted and the migration runs only once.
+		if migrated {
+			if err := Save(cfg); err != nil {
+				return nil, err
+			}
+		}
 		return cfg, nil
 	}
 	if !os.IsNotExist(err) {
@@ -173,6 +292,7 @@ func Load() (*Config, error) {
 			if err := yaml.Unmarshal(data, cfg); err != nil {
 				return nil, err
 			}
+			migrateLegacyAPI(data, cfg)
 			cfg.ResolveModelPaths()
 			if err := Save(cfg); err != nil {
 				return nil, err

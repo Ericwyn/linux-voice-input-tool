@@ -51,7 +51,7 @@ func (s *whisperSession) Finish(recorder *audio.Recorder) (string, error) {
 	}
 	defer os.Remove(tmpFile)
 
-	client := api.NewClient(s.cfg.API.BaseURL, s.cfg.API.Key, s.cfg.API.Model)
+	client := api.NewClient(s.cfg.Whisper.BaseURL, s.cfg.Whisper.Key, s.cfg.Whisper.Model)
 	return client.Transcribe(tmpFile)
 }
 

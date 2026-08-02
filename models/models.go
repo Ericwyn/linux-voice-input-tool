@@ -49,6 +49,33 @@ var All = []Model{
 	},
 }
 
+// senseVoiceModels lists the single bundle used by the local SenseVoice engine.
+// One model covers ASR plus punctuation (via inverse text normalization), so it
+// replaces the sherpa engine's separate offline-ASR and punctuation models.
+var senseVoiceModels = []Model{
+	{
+		Label: "SenseVoice (识别+标点)",
+		Dir:   "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+		URL:   "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+		Files: []string{"model.int8.onnx", "tokens.txt"},
+	},
+}
+
+// ForEngine returns the model bundles a given engine needs under the base
+// directory. Engines that use no local models (e.g. the remote whisper API, or
+// an unknown engine name) return nil, for which Check and DownloadMissing are
+// no-ops.
+func ForEngine(engineName string) []Model {
+	switch engineName {
+	case "sherpa":
+		return All
+	case "sensevoice":
+		return senseVoiceModels
+	default:
+		return nil
+	}
+}
+
 // SherpaPaths holds the six concrete model file paths the recognizer needs.
 type SherpaPaths struct {
 	Encoder       string
@@ -74,17 +101,35 @@ func Paths(baseDir string) SherpaPaths {
 	}
 }
 
+// SenseVoicePaths holds the two concrete file paths the SenseVoice recognizer
+// needs: the quantized model and its tokens table.
+type SenseVoicePaths struct {
+	Model  string
+	Tokens string
+}
+
+// SenseVoicePathsFor derives the SenseVoice model file paths from a single base
+// directory.
+func SenseVoicePathsFor(baseDir string) SenseVoicePaths {
+	dir := filepath.Join(baseDir, senseVoiceModels[0].Dir)
+	return SenseVoicePaths{
+		Model:  filepath.Join(dir, "model.int8.onnx"),
+		Tokens: filepath.Join(dir, "tokens.txt"),
+	}
+}
+
 // MissingFile describes a model file that is expected but not found on disk.
 type MissingFile struct {
 	Model string
 	Path  string
 }
 
-// Check reports which model files are missing under baseDir. A nil/empty
-// result means every model is present.
-func Check(baseDir string) []MissingFile {
+// Check reports which files in the given model set are missing under baseDir. A
+// nil/empty result means every model in the set is present. A nil/empty set
+// (e.g. an engine with no local models) reports nothing missing.
+func Check(baseDir string, set []Model) []MissingFile {
 	var missing []MissingFile
-	for _, model := range All {
+	for _, model := range set {
 		for _, file := range model.Files {
 			path := filepath.Join(baseDir, model.Dir, file)
 			if info, err := os.Stat(path); err != nil || info.Size() == 0 {
@@ -106,13 +151,85 @@ func modelPresent(baseDir string, model Model) bool {
 	return true
 }
 
-// DownloadMissing downloads and extracts any models whose files are missing
-// under baseDir. progress, if non-nil, is called with human-readable status
-// messages. Models already present are skipped.
-func DownloadMissing(baseDir string, progress func(string)) error {
+// DownloadProgress reports byte-level download progress for one model bundle.
+// It tracks the compressed download stream (the actual network transfer), so
+// Downloaded/Total are compressed bytes. Total is -1 when the server sends no
+// Content-Length.
+type DownloadProgress struct {
+	Model       string
+	Downloaded  int64
+	Total       int64
+	BytesPerSec float64
+}
+
+// String renders progress for display. With a known total it shows a
+// percentage; otherwise just the downloaded amount. Both include speed.
+func (p DownloadProgress) String() string {
+	const mb = 1024.0 * 1024.0
+	downloadedMB := float64(p.Downloaded) / mb
+	speedMB := p.BytesPerSec / mb
+	if p.Total > 0 {
+		totalMB := float64(p.Total) / mb
+		percent := float64(p.Downloaded) / float64(p.Total) * 100
+		return fmt.Sprintf("下载中: %.1f/%.1f MB (%.1f%%) %.1f MB/s",
+			downloadedMB, totalMB, percent, speedMB)
+	}
+	return fmt.Sprintf("下载中: %.1f MB %.1f MB/s", downloadedMB, speedMB)
+}
+
+// progressReader wraps an io.Reader, counting bytes read and periodically
+// invoking onProgress with the running total and a recent-window speed. Reports
+// are throttled to progressReportInterval to avoid flooding the caller.
+type progressReader struct {
+	reader     io.Reader
+	total      int64
+	model      string
+	onProgress func(DownloadProgress)
+
+	downloaded      int64
+	start           time.Time
+	lastReportTime  time.Time
+	lastReportBytes int64
+}
+
+// progressReportInterval is the minimum gap between progress callbacks.
+const progressReportInterval = 300 * time.Millisecond
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		r.downloaded += int64(n)
+	}
+
+	now := time.Now()
+	if r.onProgress != nil && now.Sub(r.lastReportTime) >= progressReportInterval {
+		window := now.Sub(r.lastReportTime).Seconds()
+		var speed float64
+		if window > 0 {
+			speed = float64(r.downloaded-r.lastReportBytes) / window
+		}
+		r.onProgress(DownloadProgress{
+			Model:       r.model,
+			Downloaded:  r.downloaded,
+			Total:       r.total,
+			BytesPerSec: speed,
+		})
+		r.lastReportTime = now
+		r.lastReportBytes = r.downloaded
+	}
+	return n, err
+}
+
+// DownloadMissing downloads and extracts any models in the given set whose
+// files are missing under baseDir. status, if non-nil, is called with
+// human-readable milestone messages ("开始下载", "完成", ...). progress, if
+// non-nil, is called with byte-level download progress for the CLI/UI to render
+// speed and percentage. Models already present are skipped. A nil/empty set
+// (e.g. an engine with no local models) is a no-op.
+func DownloadMissing(baseDir string, set []Model, status func(string), progress func(DownloadProgress)) error {
 	report := func(format string, args ...interface{}) {
-		if progress != nil {
-			progress(fmt.Sprintf(format, args...))
+		if status != nil {
+			status(fmt.Sprintf(format, args...))
 		}
 	}
 
@@ -120,13 +237,13 @@ func DownloadMissing(baseDir string, progress func(string)) error {
 		return fmt.Errorf("create model dir: %w", err)
 	}
 
-	for _, model := range All {
+	for _, model := range set {
 		if modelPresent(baseDir, model) {
 			report("已存在，跳过: %s", model.Label)
 			continue
 		}
 		report("开始下载: %s", model.Label)
-		if err := downloadAndExtract(model.URL, baseDir, report); err != nil {
+		if err := downloadAndExtract(model.URL, baseDir, model.Label, progress); err != nil {
 			return fmt.Errorf("download %s: %w", model.Label, err)
 		}
 		report("完成: %s", model.Label)
@@ -136,7 +253,9 @@ func DownloadMissing(baseDir string, progress func(string)) error {
 }
 
 // downloadAndExtract streams a .tar.bz2 from url and extracts it into destDir.
-func downloadAndExtract(url, destDir string, report func(string, ...interface{})) error {
+// When progress is non-nil, the compressed download stream is wrapped so speed
+// and percentage can be reported as bytes arrive, plus a final 100% report.
+func downloadAndExtract(url, destDir, label string, progress func(DownloadProgress)) error {
 	client := &http.Client{Timeout: 30 * time.Minute}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -148,7 +267,22 @@ func downloadAndExtract(url, destDir string, report func(string, ...interface{})
 		return fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
 	}
 
-	tarReader := tar.NewReader(bzip2.NewReader(resp.Body))
+	var source io.Reader = resp.Body
+	var tracker *progressReader
+	if progress != nil {
+		now := time.Now()
+		tracker = &progressReader{
+			reader:         resp.Body,
+			total:          resp.ContentLength,
+			model:          label,
+			onProgress:     progress,
+			start:          now,
+			lastReportTime: now,
+		}
+		source = tracker
+	}
+
+	tarReader := tar.NewReader(bzip2.NewReader(source))
 	cleanDest := filepath.Clean(destDir)
 
 	for {
@@ -179,6 +313,22 @@ func downloadAndExtract(url, destDir string, report func(string, ...interface{})
 				return err
 			}
 		}
+	}
+
+	// Emit a final report so the display ends at the full downloaded size (and
+	// 100%), which the throttled per-read reports may have skipped.
+	if tracker != nil {
+		elapsed := time.Since(tracker.start).Seconds()
+		var avgSpeed float64
+		if elapsed > 0 {
+			avgSpeed = float64(tracker.downloaded) / elapsed
+		}
+		progress(DownloadProgress{
+			Model:       label,
+			Downloaded:  tracker.downloaded,
+			Total:       tracker.total,
+			BytesPerSec: avgSpeed,
+		})
 	}
 	return nil
 }

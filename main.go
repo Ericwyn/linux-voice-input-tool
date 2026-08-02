@@ -139,7 +139,7 @@ func main() {
 	}
 
 	log.Printf("Config file: %s", config.ConfigPath())
-	log.Printf("Engine: %s", cfg.API.Engine)
+	log.Printf("Engine: %s", cfg.Engine)
 
 	// The utility subcommands do not need a working engine, so handle them
 	// before the whisper API-key gate below.
@@ -152,16 +152,22 @@ func main() {
 		return
 	}
 
-	if cfg.API.Engine == "sherpa" {
+	switch cfg.Engine {
+	case "sherpa":
 		log.Printf("Sherpa encoder: %s", cfg.Sherpa.Encoder)
 		log.Printf("Sherpa threads: %d", cfg.Sherpa.NumThreads)
-	} else {
-		if cfg.API.Key == "" && mode != modeDaemon {
+	case "sensevoice":
+		log.Printf("SenseVoice model: %s", cfg.SenseVoice.Model)
+		log.Printf("SenseVoice language=%s itn=%v threads=%d previewMs=%d",
+			cfg.SenseVoice.Language, cfg.SenseVoice.UseITN, cfg.SenseVoice.NumThreads, cfg.SenseVoice.PreviewIntervalMs)
+	default:
+		// Online engines (whisper): require an API key outside daemon mode.
+		if cfg.Whisper.Key == "" && mode != modeDaemon {
 			fmt.Printf("请先配置 API Key，编辑配置文件: %s\n", config.ConfigPath())
 			os.Exit(1)
 		}
-		log.Printf("API base URL: %s", cfg.API.BaseURL)
-		log.Printf("API model: %s", cfg.API.Model)
+		log.Printf("Whisper base URL: %s", cfg.Whisper.BaseURL)
+		log.Printf("Whisper model: %s", cfg.Whisper.Model)
 	}
 
 	switch mode {
@@ -179,19 +185,37 @@ func main() {
 // entry point (models.DownloadMissing) as the settings window button. Only the
 // sherpa engine uses local models; other engines have nothing to download.
 func runDownloadModels(cfg *config.Config) {
-	if cfg.API.Engine != "sherpa" {
-		fmt.Printf("当前引擎为 %q，无需下载本地模型（仅 sherpa 引擎使用本地模型）。\n", cfg.API.Engine)
+	set := models.ForEngine(cfg.Engine)
+	if len(set) == 0 {
+		fmt.Printf("当前引擎为 %q，无需下载本地模型（仅 sherpa / sensevoice 引擎使用本地模型）。\n", cfg.Engine)
 		return
 	}
 
-	baseDir := cfg.Sherpa.ModelDir
-	if baseDir == "" {
-		baseDir = config.DefaultModelDir()
-	}
+	baseDir := cfg.ModelBaseDir()
 	fmt.Printf("模型目录: %s\n", baseDir)
-	err := models.DownloadMissing(baseDir, func(msg string) {
+
+	// Milestone messages print on their own line; byte-level progress refreshes
+	// in place with a carriage return. inProgress tracks whether the cursor is
+	// currently sitting on an unfinished progress line, so a milestone can break
+	// to a fresh line first.
+	inProgress := false
+	status := func(msg string) {
+		if inProgress {
+			fmt.Println()
+			inProgress = false
+		}
 		fmt.Println(msg)
-	})
+	}
+	progress := func(p models.DownloadProgress) {
+		// Left-pad to a fixed width to erase any residue from a longer prior line.
+		fmt.Printf("\r%-60s", p.String())
+		inProgress = true
+	}
+
+	err := models.DownloadMissing(baseDir, set, status, progress)
+	if inProgress {
+		fmt.Println()
+	}
 	if err != nil {
 		fmt.Printf("下载失败: %v\n", err)
 		os.Exit(1)
@@ -259,7 +283,7 @@ func printUsage() {
   (无参数)            触发录音开关：有守护进程则转发给它，否则独立运行一次
   --daemon           以常驻守护进程运行（系统托盘 + 全局热键 + 设置窗口）
   --test             测试模式：录音 3 秒并识别，用于验证配置是否正确
-  --download-models  下载当前引擎所需的模型（仅 sherpa 引擎需要）
+  --download-models  下载当前引擎所需的模型（sherpa / sensevoice 引擎需要）
   --check-config     检查配置与环境依赖，并打印报告
   -h, --help         显示本帮助信息
 

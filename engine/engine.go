@@ -66,12 +66,14 @@ type Session interface {
 // single entry point to add a new engine: implement Engine/Session and add a
 // case here.
 func New(cfg *config.Config) (Engine, error) {
-	switch cfg.API.Engine {
+	switch cfg.Engine {
 	case "sherpa":
 		return newSherpaEngine(cfg), nil
+	case "sensevoice":
+		return newSenseVoiceEngine(cfg), nil
 	case "whisper":
 		return newWhisperEngine(cfg), nil
 	default:
-		return nil, fmt.Errorf("unknown engine: %q", cfg.API.Engine)
+		return nil, fmt.Errorf("unknown engine: %q", cfg.Engine)
 	}
 }

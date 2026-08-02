@@ -96,8 +96,8 @@ func checkConfigFile() Result {
 }
 
 func checkEngine(cfg *config.Config) []Result {
-	if cfg.API.Engine == "whisper" {
-		if cfg.API.Key == "" {
+	if cfg.Engine == "whisper" {
+		if cfg.Whisper.Key == "" {
 			return []Result{{Name: "whisper 引擎", OK: false,
 				Detail: "未配置 API Key，在线识别无法工作"}}
 		}
@@ -105,19 +105,20 @@ func checkEngine(cfg *config.Config) []Result {
 			Detail: "API Key 已配置"}}
 	}
 
-	// sherpa engine: verify model files exist.
-	baseDir := cfg.Sherpa.ModelDir
-	if baseDir == "" {
-		baseDir = config.DefaultModelDir()
+	// Local engines (sherpa / sensevoice): verify their model files exist.
+	label := "sherpa 模型"
+	if cfg.Engine == "sensevoice" {
+		label = "SenseVoice 模型"
 	}
-	missing := models.Check(baseDir)
+	baseDir := cfg.ModelBaseDir()
+	missing := models.Check(baseDir, models.ForEngine(cfg.Engine))
 	if len(missing) == 0 {
-		return []Result{{Name: "sherpa 模型", OK: true,
+		return []Result{{Name: label, OK: true,
 			Detail: fmt.Sprintf("全部就绪（%s）", baseDir)}}
 	}
 	detail := fmt.Sprintf("缺失 %d 个文件（运行 --download-models 或在设置中下载）:", len(missing))
 	for _, item := range missing {
 		detail += fmt.Sprintf("\n    - %s: %s", item.Model, item.Path)
 	}
-	return []Result{{Name: "sherpa 模型", OK: false, Detail: detail}}
+	return []Result{{Name: label, OK: false, Detail: detail}}
 }
