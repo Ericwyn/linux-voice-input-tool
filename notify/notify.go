@@ -104,12 +104,24 @@ func closeCurrentNotificationLater() {
 	}
 }
 
+// closeNotificationLater schedules the notification with the given id to close
+// after a short delay. It runs in a detached process so the close still happens
+// even after the standalone one-shot process exits.
+//
+// Two safeguards prevent it from disturbing a *later* recording that reused the
+// same id-tracking file:
+//   - It only closes the notification if the id file still holds this id, so a
+//     newer session (which overwrote the file with its own id) is left alone.
+//   - It deliberately does NOT delete the id file. The previous version did,
+//     which could wipe out a newer session's id mid-recording and orphan that
+//     session's resident (never-expiring) preview notification, leaving a stale
+//     "录音中: …" bubble stuck on screen after paste.
 func closeNotificationLater(id string) {
-	cmd := exec.Command(
-		"sh", "-c",
-		"sleep 3; gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.CloseNotification \"$1\" >/dev/null 2>&1; rm -f \"$2\"",
-		"sh", id, notifyIDPath(),
-	)
+	const script = `sleep 3
+if [ "$(cat "$2" 2>/dev/null)" = "$1" ]; then
+  gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.CloseNotification "$1" >/dev/null 2>&1
+fi`
+	cmd := exec.Command("sh", "-c", script, "sh", id, notifyIDPath())
 	if err := cmd.Start(); err != nil {
 		log.Printf("schedule close notification failed: %v", err)
 	}
