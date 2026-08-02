@@ -1,0 +1,89 @@
+name: Build & Release
+
+# This project is Linux/X11-only: it links the Linux-only sherpa-onnx CGO
+# binding and drives X11 (global hotkey via xgb, paste via xclip/xdotool), so
+# there is no cross-platform matrix — only linux/amd64 is built.
+#
+# On every push/PR the bundle is built to validate that it compiles and packages
+# cleanly; on a published release the resulting zip is attached as a release
+# asset. The heavy lifting is delegated to `make bundle`, which is the single
+# source of truth for what goes into a distributable bundle (binary + its
+# sherpa-onnx .so under lib/ + install/uninstall scripts + icon).
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      # Build-time system dependencies:
+      #   gcc / pkg-config        - CGO toolchain
+      #   portaudio19-dev         - microphone capture binding (CGO)
+      #   libgl1-mesa-dev/xorg-dev- fyne GUI (OpenGL + X11 headers)
+      # The sherpa-onnx shared libraries are NOT installed system-wide; they are
+      # pulled from the Go module cache and bundled by `make bundle`.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc pkg-config portaudio19-dev libgl1-mesa-dev xorg-dev
+
+      - name: Download Go dependencies
+        run: go mod download
+
+      # Assembles dist/linux-voice-input/ (self-contained) and a .tar.gz of it.
+      - name: Build self-contained bundle
+        run: make bundle
+
+      # Version label for the artifact/zip name: the release tag on a release,
+      # otherwise a git describe (falling back to the short commit SHA).
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            version="${{ github.event.release.tag_name }}"
+          else
+            version="$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Zip the assembled bundle directory so it extracts to a self-contained
+      # folder (mirroring the tar.gz layout). `make bundle` already produced the
+      # directory under dist/, so we just archive it under a versioned name.
+      - name: Package zip
+        run: |
+          cd dist
+          zip -r -y "linux-voice-input-${{ steps.ver.outputs.version }}-linux-x64.zip" linux-voice-input
+          echo "==> dist contents:"
+          ls -la
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-voice-input-${{ steps.ver.outputs.version }}-linux-x64
+          path: dist/linux-voice-input-*-linux-x64.zip
+          if-no-files-found: error
+
+      # On a published release, attach the zip as a downloadable asset.
+      - name: Upload release asset
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/linux-voice-input-*-linux-x64.zip
