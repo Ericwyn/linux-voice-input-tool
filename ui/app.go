@@ -10,6 +10,7 @@ import (
 	"fyne.io/fyne/v2"
 	fyneapp "fyne.io/fyne/v2/app"
 
+	"linux-voice-input/assets"
 	"linux-voice-input/config"
 	"linux-voice-input/hotkey"
 	"linux-voice-input/session"
@@ -37,6 +38,7 @@ type App struct {
 // builds the tray and settings window, and binds the hotkey if enabled.
 func NewApp(cfg *config.Config, controller *session.Controller) *App {
 	fyneApplication := fyneapp.NewWithID("com.github.linux-voice-input")
+	fyneApplication.SetIcon(assets.AppIcon)
 
 	app := &App{
 		fyneApp:    fyneApplication,

@@ -5,7 +5,8 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/driver/desktop"
-	"fyne.io/fyne/v2/theme"
+
+	"linux-voice-input/assets"
 )
 
 // setupTray installs the system tray menu. It is a no-op if the running fyne
@@ -46,7 +47,7 @@ func (a *App) setupTray() {
 		quitItem,
 	)
 
-	deskApp.SetSystemTrayIcon(theme.VolumeUpIcon())
+	deskApp.SetSystemTrayIcon(assets.AppIcon)
 	deskApp.SetSystemTrayMenu(menu)
 
 	a.updateTrayStatus = func(recording bool) {

@@ -1,18 +1,18 @@
 // Package session provides a reusable recording/recognition/paste controller
 // shared by both the resident daemon (models preloaded once and reused) and
-// the standalone one-shot process (models loaded on demand).
+// the standalone one-shot process (models loaded on demand). It is agnostic to
+// the recognition engine, delegating all recognition work to engine.Engine and
+// engine.Session.
 package session
 
 import (
 	"log"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
-	"linux-voice-input/api"
 	"linux-voice-input/audio"
 	"linux-voice-input/config"
+	"linux-voice-input/engine"
 	"linux-voice-input/input"
 	"linux-voice-input/notify"
 )
@@ -32,26 +32,29 @@ const toggleDebounce = 400 * time.Millisecond
 // every audio frame would overwhelm the session bus.
 const previewNotifyInterval = 300 * time.Millisecond
 
-// Controller owns the recording lifecycle and recognition engine. All public
-// methods are safe for concurrent use.
+// Controller owns the recording lifecycle and drives the recognition engine.
+// All public methods are safe for concurrent use.
 type Controller struct {
 	mu  sync.Mutex
 	cfg *config.Config
 
-	// Preloaded engine components for daemon mode; nil when running one-shot.
-	preStream  *api.SherpaStreamRecognizer
-	preOffline *api.SherpaOfflineRecognizer
-	prePunct   *api.SherpaPunctuation
+	// engine is the recognition strategy selected by config. It may be nil if
+	// the configured engine name is unknown; the recording path guards for it.
+	engine engine.Engine
+	// preloaded records whether Preload succeeded, so Reload knows whether to
+	// re-preload the rebuilt engine.
+	preloaded bool
 
 	// Active recording session state.
 	recording bool
 	recorder  *audio.Recorder
 
-	sessionStream *api.SherpaStream
-	// sessionRecognizer is a per-session streaming recognizer, non-nil only in
-	// one-shot mode where it must be closed after the session ends.
-	sessionRecognizer *api.SherpaStreamRecognizer
-	feedDone          chan struct{}
+	// activeSession is the recognition session for the current recording,
+	// non-nil only while recording.
+	activeSession engine.Session
+	// feedDone is closed when the audio-feeding goroutine drains the recorder's
+	// stream after recording stops.
+	feedDone chan struct{}
 
 	startTime    time.Time
 	targetWindow string
@@ -67,50 +70,35 @@ type Controller struct {
 	onStateChange func(recording bool)
 }
 
-// New creates a controller without preloading any models. Suitable for the
-// standalone one-shot process where models are loaded lazily per session.
+// New creates a controller and builds the recognition engine from config
+// without preloading any heavy resources. Suitable for the standalone one-shot
+// process where models are loaded lazily per session. An unknown engine name
+// is logged and leaves the engine nil; recording will then report an init
+// failure rather than crashing.
 func New(cfg *config.Config) *Controller {
-	return &Controller{cfg: cfg}
+	c := &Controller{cfg: cfg}
+	eng, err := engine.New(cfg)
+	if err != nil {
+		log.Printf("Engine init failed: %v", err)
+	}
+	c.engine = eng
+	return c
 }
 
-// Preload loads the sherpa models (streaming, offline, punctuation) once so
-// that subsequent Toggle calls in the daemon reuse them. It is a no-op for the
-// whisper engine, which transcribes via a remote API.
+// Preload eagerly loads the engine's heavy resources once so that subsequent
+// Toggle calls in the daemon reuse them. For engines that need no preloading
+// (e.g. whisper) it is a no-op inside the engine.
 func (c *Controller) Preload() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.cfg.API.Engine != "sherpa" {
+	if c.engine == nil {
 		return nil
 	}
-	return c.loadEngineLocked()
-}
-
-// loadEngineLocked builds the sherpa recognizers. Caller must hold c.mu.
-func (c *Controller) loadEngineLocked() error {
-	streamRecognizer, err := api.NewSherpaStreamRecognizer(c.cfg.Sherpa)
-	if err != nil {
+	if err := c.engine.Preload(); err != nil {
 		return err
 	}
-
-	offlineRecognizer, err := api.NewSherpaOfflineRecognizer(c.cfg.Sherpa)
-	if err != nil {
-		log.Printf("Offline recognizer unavailable at preload: %v", err)
-	}
-
-	var punct *api.SherpaPunctuation
-	if c.cfg.Sherpa.PunctModel != "" {
-		punct, err = api.NewSherpaPunctuation(c.cfg.Sherpa.PunctModel)
-		if err != nil {
-			log.Printf("Punctuation model unavailable at preload: %v", err)
-			punct = nil
-		}
-	}
-
-	c.preStream = streamRecognizer
-	c.preOffline = offlineRecognizer
-	c.prePunct = punct
-	log.Println("Sherpa engine preloaded for reuse")
+	c.preloaded = true
 	return nil
 }
 
@@ -203,56 +191,57 @@ func (c *Controller) StartRecording() error {
 	c.startTime = time.Now()
 	notify.If(c.cfg.Notifications.Start, "语音输入", "录音中", false)
 
-	if c.cfg.API.Engine == "sherpa" {
-		recognizer := c.preStream
-		if recognizer == nil {
-			var err error
-			recognizer, err = api.NewSherpaStreamRecognizer(c.cfg.Sherpa)
-			if err != nil {
-				notify.FinalIf(c.cfg.Notifications.TranscribeFailed, "语音输入", "识别引擎初始化失败")
-				// Continue recording anyway; offline model may still transcribe.
-				log.Printf("Streaming recognizer init failed: %v", err)
-			} else {
-				c.sessionRecognizer = recognizer
-			}
-		}
-
-		if recognizer != nil {
-			stream := recognizer.CreateStream()
-			c.sessionStream = stream
-			done := make(chan struct{})
-			c.feedDone = done
-			notificationsStart := c.cfg.Notifications.Start
-			audioStream := recorder.AudioStream
-			go func() {
-				defer close(done)
-				// Throttle preview notifications: each notify.Persistent spawns
-				// a gdbus process, so firing it on every ~64ms audio frame would
-				// swamp the session bus. Only update when the text changed and
-				// at most every previewNotifyInterval.
-				var lastPreview string
-				var lastNotifyTime time.Time
-				for samples := range audioStream {
-					stream.FeedAudio(samples)
-					if !notificationsStart {
-						continue
-					}
-					partial := stream.GetPartialResult()
-					now := time.Now()
-					if partial != "" && partial != lastPreview &&
-						now.Sub(lastNotifyTime) >= previewNotifyInterval {
-						notify.Persistent("语音输入", "录音中: "+partial)
-						lastPreview = partial
-						lastNotifyTime = now
-					}
-				}
-			}()
+	if c.engine != nil {
+		session, err := c.engine.NewSession()
+		if err != nil {
+			notify.FinalIf(c.cfg.Notifications.TranscribeFailed, "语音输入", "识别引擎初始化失败")
+			// Continue recording anyway; the session may still transcribe.
+			log.Printf("Recognition session init failed: %v", err)
+		} else {
+			c.activeSession = session
+			c.startFeedLoop(recorder, session)
 		}
 	}
 
 	log.Println("Recording started")
 	go c.notifyStateChange(true)
 	return nil
+}
+
+// startFeedLoop launches the goroutine that feeds recorded audio frames to the
+// session and, for engines that support it, emits throttled live-preview
+// notifications. Caller must hold c.mu.
+func (c *Controller) startFeedLoop(recorder *audio.Recorder, session engine.Session) {
+	done := make(chan struct{})
+	c.feedDone = done
+
+	supportsPreview := c.engine.SupportsPreview()
+	notificationsStart := c.cfg.Notifications.Start
+	audioStream := recorder.AudioStream
+
+	go func() {
+		defer close(done)
+		// Throttle preview notifications: each notify.Persistent spawns a gdbus
+		// process, so firing it on every ~64ms audio frame would swamp the
+		// session bus. Only update when the text changed and at most every
+		// previewNotifyInterval.
+		var lastPreview string
+		var lastNotifyTime time.Time
+		for samples := range audioStream {
+			session.FeedAudio(samples)
+			if !notificationsStart || !supportsPreview {
+				continue
+			}
+			partial := session.PartialText()
+			now := time.Now()
+			if partial != "" && partial != lastPreview &&
+				now.Sub(lastNotifyTime) >= previewNotifyInterval {
+				notify.Persistent("语音输入", "录音中: "+partial)
+				lastPreview = partial
+				lastNotifyTime = now
+			}
+		}
+	}()
 }
 
 // StopAndTranscribe stops the active recording, runs recognition, and pastes
@@ -265,8 +254,7 @@ func (c *Controller) StopAndTranscribe() {
 	}
 
 	recorder := c.recorder
-	sessionStream := c.sessionStream
-	sessionRecognizer := c.sessionRecognizer
+	activeSession := c.activeSession
 	feedDone := c.feedDone
 	startTime := c.startTime
 	targetWindow := c.targetWindow
@@ -274,8 +262,7 @@ func (c *Controller) StopAndTranscribe() {
 
 	c.recording = false
 	c.recorder = nil
-	c.sessionStream = nil
-	c.sessionRecognizer = nil
+	c.activeSession = nil
 	c.feedDone = nil
 	c.lock = nil
 	c.mu.Unlock()
@@ -283,11 +270,8 @@ func (c *Controller) StopAndTranscribe() {
 	go c.notifyStateChange(false)
 
 	defer func() {
-		if sessionStream != nil {
-			sessionStream.Close()
-		}
-		if sessionRecognizer != nil {
-			sessionRecognizer.Close()
+		if activeSession != nil {
+			activeSession.Close()
 		}
 		// Release the system-wide recording lock only after transcription
 		// finishes, so a queued toggle cannot start a new recording mid-flight.
@@ -301,7 +285,7 @@ func (c *Controller) StopAndTranscribe() {
 	}
 
 	// Wait for the feeding goroutine to drain the closed audio stream so that
-	// GetPartialResult/Finish on sessionStream is safe.
+	// PartialText/Finish on the session is safe.
 	if feedDone != nil {
 		<-feedDone
 	}
@@ -315,7 +299,7 @@ func (c *Controller) StopAndTranscribe() {
 		return
 	}
 
-	text := c.transcribe(recorder, sessionStream)
+	text := c.transcribe(recorder, activeSession)
 
 	if text == "" {
 		notify.FinalIf(c.cfg.Notifications.EmptyResult, "语音输入", "未识别到内容")
@@ -334,78 +318,20 @@ func (c *Controller) StopAndTranscribe() {
 	log.Println("Done")
 }
 
-// transcribe runs the appropriate recognition path and returns the final text.
-func (c *Controller) transcribe(recorder *audio.Recorder, sessionStream *api.SherpaStream) string {
-	if c.cfg.API.Engine == "sherpa" {
-		return c.transcribeSherpa(recorder, sessionStream)
-	}
-	return c.transcribeWhisper(recorder)
-}
-
-func (c *Controller) transcribeSherpa(recorder *audio.Recorder, sessionStream *api.SherpaStream) string {
-	var text string
-
-	offline := c.preOffline
-	ownedOffline := false
-	if offline == nil {
-		var err error
-		offline, err = api.NewSherpaOfflineRecognizer(c.cfg.Sherpa)
-		if err != nil {
-			log.Printf("Offline model unavailable, falling back to streaming result: %v", err)
-			if sessionStream != nil {
-				return sessionStream.Finish()
-			}
-			return ""
-		}
-		ownedOffline = true
-	}
-	if ownedOffline {
-		defer offline.Close()
-	}
-
-	startTime := time.Now()
-	samples := recorder.GetSamplesFloat32()
-	text, _ = offline.TranscribeAudioSamples(samples)
-	log.Printf("Offline recognition done in %dms: %s", time.Since(startTime).Milliseconds(), text)
-
-	if text == "" || c.cfg.Sherpa.PunctModel == "" {
-		return text
-	}
-
-	punct := c.prePunct
-	ownedPunct := false
-	if punct == nil {
-		var err error
-		punct, err = api.NewSherpaPunctuation(c.cfg.Sherpa.PunctModel)
-		if err != nil {
-			log.Printf("Punctuation model unavailable: %v", err)
-			return text
-		}
-		ownedPunct = true
-	}
-	if ownedPunct {
-		defer punct.Close()
-	}
-
-	startTime = time.Now()
-	text = punct.AddPunct(text)
-	log.Printf("Punctuation done in %dms: %s", time.Since(startTime).Milliseconds(), text)
-	return text
-}
-
-func (c *Controller) transcribeWhisper(recorder *audio.Recorder) string {
-	notify.If(c.cfg.Notifications.Start, "语音输入", "识别中", false)
-
-	tmpFile := filepath.Join(os.TempDir(), "linux-voice-input.wav")
-	if err := recorder.SaveWAV(tmpFile); err != nil {
-		notify.FinalIf(c.cfg.Notifications.SaveFailed, "语音输入", "保存录音失败")
-		log.Printf("Save WAV failed: %v", err)
+// transcribe drives the session to produce the final text. For engines without
+// live preview (e.g. whisper) it emits a "recognizing" notification first,
+// since there was no preview during recording. A recognition error is reported
+// once here and yields empty text.
+func (c *Controller) transcribe(recorder *audio.Recorder, activeSession engine.Session) string {
+	if activeSession == nil {
 		return ""
 	}
-	defer os.Remove(tmpFile)
 
-	apiClient := api.NewClient(c.cfg.API.BaseURL, c.cfg.API.Key, c.cfg.API.Model)
-	text, err := apiClient.Transcribe(tmpFile)
+	if c.engine != nil && !c.engine.SupportsPreview() {
+		notify.If(c.cfg.Notifications.Start, "语音输入", "识别中", false)
+	}
+
+	text, err := activeSession.Finish(recorder)
 	if err != nil {
 		notify.FinalIf(c.cfg.Notifications.TranscribeFailed, "语音输入", "识别失败")
 		log.Printf("Transcription failed: %v", err)
@@ -414,9 +340,10 @@ func (c *Controller) transcribeWhisper(recorder *audio.Recorder) string {
 	return text
 }
 
-// Reload swaps the configuration and rebuilds the preloaded engine if needed.
-// It is intended to be called from the settings window after saving. It is a
-// no-op to reload while a recording is in progress.
+// Reload swaps the configuration and rebuilds the engine if needed. It is
+// intended to be called from the settings window after saving. It is a no-op
+// to reload while a recording is in progress (only the config pointer is
+// updated).
 func (c *Controller) Reload(cfg *config.Config) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -427,12 +354,26 @@ func (c *Controller) Reload(cfg *config.Config) error {
 		return nil
 	}
 
-	hadPreload := c.preStream != nil || c.preOffline != nil || c.prePunct != nil
-	c.closeEngineLocked()
+	wasPreloaded := c.preloaded
+	if c.engine != nil {
+		c.engine.Close()
+	}
+	c.preloaded = false
 	c.cfg = cfg
 
-	if hadPreload && cfg.API.Engine == "sherpa" {
-		return c.loadEngineLocked()
+	eng, err := engine.New(cfg)
+	if err != nil {
+		log.Printf("Engine init failed on reload: %v", err)
+		c.engine = nil
+		return err
+	}
+	c.engine = eng
+
+	if wasPreloaded {
+		if err := c.engine.Preload(); err != nil {
+			return err
+		}
+		c.preloaded = true
 	}
 	return nil
 }
@@ -444,25 +385,12 @@ func (c *Controller) Config() *config.Config {
 	return c.cfg
 }
 
-// closeEngineLocked releases preloaded models. Caller must hold c.mu.
-func (c *Controller) closeEngineLocked() {
-	if c.preStream != nil {
-		c.preStream.Close()
-		c.preStream = nil
-	}
-	if c.preOffline != nil {
-		c.preOffline.Close()
-		c.preOffline = nil
-	}
-	if c.prePunct != nil {
-		c.prePunct.Close()
-		c.prePunct = nil
-	}
-}
-
 // Close releases all held resources. Safe to call multiple times.
 func (c *Controller) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.closeEngineLocked()
+	if c.engine != nil {
+		c.engine.Close()
+	}
+	c.preloaded = false
 }

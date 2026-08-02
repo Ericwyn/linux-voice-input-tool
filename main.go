@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	"linux-voice-input/api"
 	"linux-voice-input/audio"
 	"linux-voice-input/config"
 	"linux-voice-input/doctor"
+	"linux-voice-input/engine"
 	"linux-voice-input/models"
 	"linux-voice-input/session"
 	"linux-voice-input/ui"
@@ -117,6 +117,12 @@ func main() {
 
 	mode := parseMode(os.Args[1:])
 
+	// Help needs no config or models; print and exit immediately.
+	if mode == modeHelp {
+		printUsage()
+		return
+	}
+
 	// For the toggle (no-arg) path, probe for a running instance before
 	// loading any config or models: if the daemon (or a standalone recorder)
 	// is listening, just forward a toggle and exit immediately.
@@ -170,8 +176,14 @@ func main() {
 
 // runDownloadModels downloads any missing sherpa model bundles into the
 // configured model directory, printing progress to stdout. Shares the same
-// entry point (models.DownloadMissing) as the settings window button.
+// entry point (models.DownloadMissing) as the settings window button. Only the
+// sherpa engine uses local models; other engines have nothing to download.
 func runDownloadModels(cfg *config.Config) {
+	if cfg.API.Engine != "sherpa" {
+		fmt.Printf("当前引擎为 %q，无需下载本地模型（仅 sherpa 引擎使用本地模型）。\n", cfg.API.Engine)
+		return
+	}
+
 	baseDir := cfg.Sherpa.ModelDir
 	if baseDir == "" {
 		baseDir = config.DefaultModelDir()
@@ -214,11 +226,14 @@ const (
 	modeTest
 	modeDownloadModels
 	modeCheckConfig
+	modeHelp
 )
 
 func parseMode(args []string) runMode {
 	for _, arg := range args {
 		switch arg {
+		case "-h", "--help":
+			return modeHelp
 		case "--test":
 			return modeTest
 		case "--daemon":
@@ -230,6 +245,27 @@ func parseMode(args []string) runMode {
 		}
 	}
 	return modeToggle
+}
+
+// printUsage prints the command-line help. It intentionally needs no config so
+// it can run before any config/model loading.
+func printUsage() {
+	fmt.Print(`Linux Voice Input - 面向 Ubuntu/X11 的轻量语音输入工具
+
+用法:
+  linux-voice-input [选项]
+
+选项:
+  (无参数)            触发录音开关：有守护进程则转发给它，否则独立运行一次
+  --daemon           以常驻守护进程运行（系统托盘 + 全局热键 + 设置窗口）
+  --test             测试模式：录音 3 秒并识别，用于验证配置是否正确
+  --download-models  下载当前引擎所需的模型（仅 sherpa 引擎需要）
+  --check-config     检查配置与环境依赖，并打印报告
+  -h, --help         显示本帮助信息
+
+配置文件:
+  ` + config.ConfigPath() + `
+`)
 }
 
 // runStandalone reproduces the original one-shot behavior for when no daemon is
@@ -354,12 +390,23 @@ func handleSignals(app *ui.App) {
 
 func runTestMode(cfg *config.Config) {
 	const testDuration = 3 * time.Second
-	testWavPath := filepath.Join(config.AppDir(), "test-temp.wav")
 
 	if err := audio.Init(); err != nil {
 		log.Fatalf("Failed to initialize audio: %v", err)
 	}
 	defer audio.Terminate()
+
+	eng, err := engine.New(cfg)
+	if err != nil {
+		log.Fatalf("Failed to create engine: %v", err)
+	}
+	defer eng.Close()
+
+	sess, err := eng.NewSession()
+	if err != nil {
+		log.Fatalf("Failed to create session: %v", err)
+	}
+	defer sess.Close()
 
 	recorder := audio.NewRecorder(cfg.Audio.SampleRate)
 
@@ -368,25 +415,15 @@ func runTestMode(cfg *config.Config) {
 		log.Fatalf("Failed to start recording: %v", err)
 	}
 
-	var sherpaStream *api.SherpaStream
-	var sherpaRecognizer *api.SherpaStreamRecognizer
-	if cfg.API.Engine == "sherpa" {
-		var err error
-		sherpaRecognizer, err = api.NewSherpaStreamRecognizer(cfg.Sherpa)
-		if err != nil {
-			log.Fatalf("Failed to create sherpa recognizer: %v", err)
+	// Feed audio frames to the session while recording. For engines without a
+	// streaming stage (e.g. whisper) FeedAudio is a no-op.
+	feedDone := make(chan struct{})
+	go func() {
+		defer close(feedDone)
+		for samples := range recorder.AudioStream {
+			sess.FeedAudio(samples)
 		}
-		defer sherpaRecognizer.Close()
-
-		sherpaStream = sherpaRecognizer.CreateStream()
-		defer sherpaStream.Close()
-
-		go func() {
-			for samples := range recorder.AudioStream {
-				sherpaStream.FeedAudio(samples)
-			}
-		}()
-	}
+	}()
 
 	time.Sleep(testDuration)
 	fmt.Println("[TEST] 录音结束")
@@ -394,56 +431,20 @@ func runTestMode(cfg *config.Config) {
 	if err := recorder.Stop(); err != nil {
 		log.Fatalf("Failed to stop recording: %v", err)
 	}
+	<-feedDone
 
-	fmt.Printf("[TEST] 保存录音到: %s\n", testWavPath)
-	if err := recorder.SaveWAV(testWavPath); err != nil {
-		log.Fatalf("Failed to save WAV: %v", err)
-	}
-
+	// The per-stage timing (streaming/offline/punctuation) is logged inside the
+	// sherpa engine's Finish and surfaces here via the stderr MultiWriter.
 	fmt.Println("[TEST] 开始识别...")
-	var text string
-	if cfg.API.Engine == "sherpa" {
-		startTime := time.Now()
-		streamingText := sherpaStream.Finish()
-		fmt.Printf("[TEST] 流式识别结果 (耗时 %dms): %s\n", time.Since(startTime).Milliseconds(), streamingText)
-
-		fmt.Println("[TEST] 使用离线大模型重新识别...")
-		startTime = time.Now()
-		offlineRecognizer, offlineErr := api.NewSherpaOfflineRecognizer(cfg.Sherpa)
-		if offlineErr != nil {
-			fmt.Printf("[TEST] 离线模型不可用，使用流式结果: %v\n", offlineErr)
-			text = streamingText
-		} else {
-			defer offlineRecognizer.Close()
-			samples := recorder.GetSamplesFloat32()
-			text, _ = offlineRecognizer.TranscribeAudioSamples(samples)
-			fmt.Printf("[TEST] 离线模型识别结果 (耗时 %dms): %s\n", time.Since(startTime).Milliseconds(), text)
-		}
-
-		if text != "" && cfg.Sherpa.PunctModel != "" {
-			fmt.Println("[TEST] 添加标点...")
-			startTime = time.Now()
-			punct, punctErr := api.NewSherpaPunctuation(cfg.Sherpa.PunctModel)
-			if punctErr != nil {
-				fmt.Printf("[TEST] 标点模型不可用: %v\n", punctErr)
-			} else {
-				defer punct.Close()
-				text = punct.AddPunct(text)
-				fmt.Printf("[TEST] 加标点后 (耗时 %dms): %s\n", time.Since(startTime).Milliseconds(), text)
-			}
-		}
-	} else {
-		apiClient := api.NewClient(cfg.API.BaseURL, cfg.API.Key, cfg.API.Model)
-		var err error
-		text, err = apiClient.Transcribe(testWavPath)
-		if err != nil {
-			log.Fatalf("Transcription failed: %v", err)
-		}
+	startTime := time.Now()
+	text, err := sess.Finish(recorder)
+	if err != nil {
+		log.Fatalf("Transcription failed: %v", err)
 	}
 
 	if text == "" {
 		fmt.Println("[TEST] 识别结果: (空，未识别到内容)")
 	} else {
-		fmt.Printf("[TEST] 识别结果: %s\n", text)
+		fmt.Printf("[TEST] 识别结果 (总耗时 %dms): %s\n", time.Since(startTime).Milliseconds(), text)
 	}
 }
