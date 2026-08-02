@@ -144,6 +144,22 @@ make uninstall
 
 > whisper 引擎无需本地模型，运行该命令会提示「无需下载」。
 
+#### 通过代理下载
+
+模型托管在 GitHub Release，国内网络访问可能超时。下载器使用 Go 标准 HTTP 客户端，会自动读取代理环境变量，因此设置对应变量即可走代理：
+
+```bash
+# socks5 代理（如 127.0.0.1:10808）
+ALL_PROXY=socks5://127.0.0.1:10808 ./linux-voice-input --download-models
+
+# http 代理
+HTTPS_PROXY=http://127.0.0.1:7890 ./linux-voice-input --download-models
+```
+
+> 若本地 DNS 也被污染导致域名解析失败，socks5 代理可改用 `socks5h://`（让代理端解析域名）：`ALL_PROXY=socks5h://127.0.0.1:10808`。
+>
+> 注意：`proxychains` 对本程序无效——Go 直接走系统调用建立连接，绕过了 `proxychains` 依赖的 libc 劫持，所以请使用上面的环境变量方式。
+
 ### 4. 验证与运行
 
 检查环境依赖和模型是否就绪：
