@@ -39,6 +39,9 @@ type App struct {
 func NewApp(cfg *config.Config, controller *session.Controller) *App {
 	fyneApplication := fyneapp.NewWithID("com.github.linux-voice-input")
 	fyneApplication.SetIcon(assets.AppIcon)
+	// Bolder text renders crisper than the thin default font on many Linux
+	// displays; this applies app-wide (settings window, download window, ...).
+	fyneApplication.Settings().SetTheme(newBoldTheme())
 
 	app := &App{
 		fyneApp:    fyneApplication,

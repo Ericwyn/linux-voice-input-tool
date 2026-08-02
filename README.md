@@ -3,7 +3,7 @@
 面向 Ubuntu / X11 桌面的轻量语音输入工具。按一次快捷键开始录音，再按一次停止并识别，识别结果自动粘贴到当前光标所在的输入框。
 
 - **本地优先**：默认使用本地 SenseVoice 模型，完全离线，识别 + 标点一步到位。
-- **两种触发方式**：Ubuntu 自定义快捷键（无参数运行）或常驻守护进程（`--daemon`，自带全局热键 + 系统托盘 + 图形设置）。
+- **两种触发方式**：Ubuntu 自定义快捷键（`--record`）或常驻守护进程（`--daemon`，自带全局热键 + 系统托盘 + 图形设置）。
 - **三种识别引擎**：本地 SenseVoice（默认）、本地 sherpa 三模型 pipeline、在线 whisper API，可按需切换。
 
 ---
@@ -104,6 +104,32 @@ cd linux-voice-input
 go build -o linux-voice-input .
 ```
 
+或使用 Makefile：
+
+```bash
+make build        # 编译二进制到当前目录
+```
+
+#### 安装到用户目录（可选）
+
+`make install` 会编译并把二进制、图标和桌面项安装到当前用户的 XDG 目录（无需 sudo）：
+
+```bash
+make install
+```
+
+- 二进制 → `~/.local/bin/linux-voice-input`
+- 图标 → `~/.local/share/icons/hicolor/512x512/apps/linux-voice-input.png`
+- 桌面项 → `~/.local/share/applications/linux-voice-input.desktop`
+
+安装后可在应用菜单中搜索 “Linux Voice Input” 直接点击启动（以 `--daemon` 守护进程模式运行，自带托盘和全局热键）。若要卸载：
+
+```bash
+make uninstall
+```
+
+> 想装到系统级路径可传入 `PREFIX`，例如 `sudo make install PREFIX=/usr/local`。若 `~/.local/bin` 不在 `PATH` 中，命令行调用请先将其加入 `PATH`。
+
 ### 3. 下载模型
 
 本地引擎（sensevoice / sherpa）需要模型文件。程序内置下载命令，会把当前引擎所需的模型下载并解压到 `~/.linux-voice-input/models/`，并显示进度与速度：
@@ -142,13 +168,16 @@ go build -o linux-voice-input .
 linux-voice-input [选项]
 
 选项:
-  (无参数)            触发录音开关：有守护进程则转发给它，否则独立运行一次
+  --record           触发录音开关：有守护进程则转发给它，否则独立运行一次
   --daemon           以常驻守护进程运行（系统托盘 + 全局热键 + 设置窗口）
   --test             测试模式：录音 3 秒并识别，用于验证配置是否正确
   --download-models  下载当前引擎所需的模型（sherpa / sensevoice 引擎需要）
   --check-config     检查配置与环境依赖，并打印报告
-  -h, --help         显示帮助信息
+  -v, --version      显示版本号
+  -h, --help         显示本帮助信息（无参数时默认显示）
 ```
+
+> 从 v0.1.0 起，无参数运行会显示帮助信息；触发录音请使用 `--record`（Ubuntu 快捷键也应绑定到 `--record`）。
 
 `--download-models` 输出示例：
 
@@ -208,7 +237,7 @@ linux-voice-input [选项]
 打开 `Settings → Keyboard → Keyboard Shortcuts → Custom Shortcuts`，添加：
 
 - **Name**：`Linux Voice Input`
-- **Command**：`/path/to/linux-voice-input`
+- **Command**：`/path/to/linux-voice-input --record`
 - **Shortcut**：例如 `Alt+Shift+G`
 
 使用方式：
@@ -217,7 +246,7 @@ linux-voice-input [选项]
 2. 按一次快捷键开始录音。
 3. 再按一次快捷键停止录音并自动输入。
 
-无参数运行时，程序会先探测是否有守护进程在跑：
+`--record` 运行时，程序会先探测是否有守护进程在跑：
 
 - **有**：把 toggle 转发给守护进程，复用已加载的模型（快），随即退出。
 - **没有**：退化为独立的一次性进程，加载模型 → 录音 → 识别 → 粘贴 → 退出。

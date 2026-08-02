@@ -47,7 +47,7 @@ func (a *App) setupTray() {
 		quitItem,
 	)
 
-	deskApp.SetSystemTrayIcon(assets.AppIcon)
+	deskApp.SetSystemTrayIcon(assets.TrayIcon)
 	deskApp.SetSystemTrayMenu(menu)
 
 	a.updateTrayStatus = func(recording bool) {

@@ -2,18 +2,23 @@ package ui
 
 import (
 	"fmt"
+	"image/color"
 	"log"
 	"strconv"
 	"strings"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"linux-voice-input/config"
 	"linux-voice-input/doctor"
 	"linux-voice-input/models"
+	"linux-voice-input/version"
 )
 
 // settingsForm holds references to every editable widget so that Save can
@@ -234,7 +239,21 @@ func (a *App) buildSettingsContent(window fyne.Window, form *settingsForm) fyne.
 		a.runDoctorCheck(window)
 	})
 
-	buttons := container.NewHBox(saveButton, cancelButton, doctorButton)
+	// The version label sits at the far right of the button bar, after all the
+	// action buttons, as a subtle footer. Normal text size (rather than the
+	// smaller caption size) plus bold keeps it legible instead of blurry.
+	versionLabel := canvas.NewText("v"+version.Version, color.NRGBA{R: 0x88, G: 0x88, B: 0x88, A: 0xff})
+	versionLabel.TextSize = theme.TextSize()
+	versionLabel.TextStyle = fyne.TextStyle{Bold: true}
+	versionLabel.Alignment = fyne.TextAlignTrailing
+
+	// layout.NewSpacer pushes the version label to the trailing edge so the
+	// action buttons stay grouped on the left.
+	buttons := container.NewHBox(
+		saveButton, cancelButton, doctorButton,
+		layout.NewSpacer(),
+		container.NewCenter(versionLabel),
+	)
 
 	body := container.NewVBox(
 		widget.NewLabelWithStyle("识别引擎", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
@@ -250,8 +269,13 @@ func (a *App) buildSettingsContent(window fyne.Window, form *settingsForm) fyne.
 		notifAccordion,
 	)
 
-	scroll := container.NewVScroll(body)
-	return container.NewBorder(nil, buttons, nil, nil, scroll)
+	// Pad the body *inside* the scroll so the content keeps a gap from the
+	// scrollbar on the right (and the window edges elsewhere), rather than the
+	// scrollbar sitting flush against the text. The button bar gets matching
+	// horizontal padding so it lines up with the padded body.
+	scroll := container.NewVScroll(container.NewPadded(body))
+	paddedButtons := container.NewPadded(buttons)
+	return container.NewBorder(nil, paddedButtons, nil, nil, scroll)
 }
 
 // checkModels inspects the model directory and reports which files are missing
@@ -269,33 +293,76 @@ func (a *App) checkModels(engineName, baseDir string, status *widget.Label) {
 	status.SetText(text)
 }
 
-// downloadModels downloads and extracts any missing bundles for the given
-// engine's model set into baseDir, updating the status label with progress. It
-// runs off the UI goroutine.
-func (a *App) downloadModels(window fyne.Window, engineName, baseDir string, status *widget.Label) {
+// downloadModels opens a dedicated progress window and downloads/extracts any
+// missing bundles for the given engine's model set into baseDir. The window
+// shows the current milestone, a progress bar, and a speed/percentage line,
+// updated live as bytes arrive. When finished it refreshes the settings-panel
+// status label. The download itself runs off the UI goroutine.
+func (a *App) downloadModels(parent fyne.Window, engineName, baseDir string, status *widget.Label) {
 	if baseDir == "" {
-		dialog.ShowError(fmt.Errorf("请先填写模型目录"), window)
+		dialog.ShowError(fmt.Errorf("请先填写模型目录"), parent)
 		return
 	}
 
 	set := models.ForEngine(engineName)
-	fyne.Do(func() { status.SetText("准备下载…") })
+	if len(set) == 0 {
+		dialog.ShowInformation("无需下载", "当前引擎不使用本地模型（仅 sherpa / sensevoice 引擎需要）。", parent)
+		return
+	}
+
+	progressWindow := a.fyneApp.NewWindow("下载模型")
+	progressWindow.Resize(fyne.NewSize(480, 220))
+
+	titleLabel := widget.NewLabelWithStyle("准备下载…", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	progressBar := widget.NewProgressBar()
+	detailLabel := widget.NewLabel("")
+	detailLabel.Wrapping = fyne.TextWrapWord
+
+	// The close button stays disabled while the download is in flight so the
+	// user does not accidentally dismiss an active transfer; it is enabled once
+	// the run completes (successfully or with an error).
+	closeButton := widget.NewButton("关闭", func() { progressWindow.Close() })
+	closeButton.Disable()
+
+	content := container.NewBorder(
+		nil,
+		container.NewHBox(layout.NewSpacer(), closeButton),
+		nil, nil,
+		container.NewVBox(titleLabel, progressBar, detailLabel),
+	)
+	progressWindow.SetContent(container.NewPadded(content))
+	progressWindow.Show()
 
 	go func() {
 		onStatus := func(msg string) {
-			fyne.Do(func() { status.SetText(msg) })
+			fyne.Do(func() { titleLabel.SetText(msg) })
 		}
 		onProgress := func(p models.DownloadProgress) {
+			// A known total drives the bar as a fraction; otherwise the bar is
+			// left at zero and only the byte/speed line advances.
+			var fraction float64
+			if p.Total > 0 {
+				fraction = float64(p.Downloaded) / float64(p.Total)
+			}
 			text := p.String()
-			fyne.Do(func() { status.SetText(text) })
+			fyne.Do(func() {
+				if p.Total > 0 {
+					progressBar.SetValue(fraction)
+				}
+				detailLabel.SetText(text)
+			})
 		}
 		err := models.DownloadMissing(baseDir, set, onStatus, onProgress)
 		fyne.Do(func() {
+			closeButton.Enable()
 			if err != nil {
+				titleLabel.SetText("下载失败")
+				detailLabel.SetText(err.Error())
 				status.SetText("下载失败: " + err.Error())
-				dialog.ShowError(err, window)
 				return
 			}
+			titleLabel.SetText("全部模型就绪 ✓")
+			progressBar.SetValue(1)
 			a.checkModels(engineName, baseDir, status)
 		})
 	}()

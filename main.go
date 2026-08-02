@@ -19,6 +19,7 @@ import (
 	"linux-voice-input/models"
 	"linux-voice-input/session"
 	"linux-voice-input/ui"
+	"linux-voice-input/version"
 )
 
 const socketName = "linux-voice-input.sock"
@@ -117,16 +118,20 @@ func main() {
 
 	mode := parseMode(os.Args[1:])
 
-	// Help needs no config or models; print and exit immediately.
+	// Help and version need no config or models; print and exit immediately.
 	if mode == modeHelp {
 		printUsage()
 		return
 	}
+	if mode == modeVersion {
+		fmt.Println(version.String())
+		return
+	}
 
-	// For the toggle (no-arg) path, probe for a running instance before
-	// loading any config or models: if the daemon (or a standalone recorder)
-	// is listening, just forward a toggle and exit immediately.
-	if mode == modeToggle {
+	// For the record path, probe for a running instance before loading any
+	// config or models: if the daemon (or a standalone recorder) is listening,
+	// just forward a toggle and exit immediately.
+	if mode == modeRecord {
 		if sendCommand(socketPath(), "toggle") {
 			log.Println("Forwarded toggle to running instance")
 			return
@@ -245,12 +250,15 @@ func runCheckConfig(cfg *config.Config) {
 type runMode int
 
 const (
-	modeToggle runMode = iota
+	// modeHelp is the default when no arguments are given; it prints usage and
+	// exits without loading any config or models.
+	modeHelp runMode = iota
+	modeRecord
 	modeDaemon
 	modeTest
 	modeDownloadModels
 	modeCheckConfig
-	modeHelp
+	modeVersion
 )
 
 func parseMode(args []string) runMode {
@@ -258,6 +266,10 @@ func parseMode(args []string) runMode {
 		switch arg {
 		case "-h", "--help":
 			return modeHelp
+		case "-v", "--version":
+			return modeVersion
+		case "--record":
+			return modeRecord
 		case "--test":
 			return modeTest
 		case "--daemon":
@@ -268,24 +280,26 @@ func parseMode(args []string) runMode {
 			return modeCheckConfig
 		}
 	}
-	return modeToggle
+	// No recognized arguments: show help rather than silently recording.
+	return modeHelp
 }
 
 // printUsage prints the command-line help. It intentionally needs no config so
 // it can run before any config/model loading.
 func printUsage() {
-	fmt.Print(`Linux Voice Input - 面向 Ubuntu/X11 的轻量语音输入工具
+	fmt.Print(version.String() + ` - 面向 Ubuntu/X11 的轻量语音输入工具
 
 用法:
   linux-voice-input [选项]
 
 选项:
-  (无参数)            触发录音开关：有守护进程则转发给它，否则独立运行一次
+  --record           触发录音开关：有守护进程则转发给它，否则独立运行一次
   --daemon           以常驻守护进程运行（系统托盘 + 全局热键 + 设置窗口）
   --test             测试模式：录音 3 秒并识别，用于验证配置是否正确
   --download-models  下载当前引擎所需的模型（sherpa / sensevoice 引擎需要）
   --check-config     检查配置与环境依赖，并打印报告
-  -h, --help         显示本帮助信息
+  -v, --version      显示版本号
+  -h, --help         显示本帮助信息（无参数时默认显示）
 
 配置文件:
   ` + config.ConfigPath() + `
