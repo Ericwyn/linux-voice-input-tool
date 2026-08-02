@@ -2,7 +2,12 @@
 
 一个面向 Ubuntu/X11 桌面的轻量语音输入工具。
 
-通过 Ubuntu Desktop 自定义快捷键触发：第一次触发开始录音，第二次触发停止录音并识别，把识别结果粘贴到当前输入框。
+触发一次开始录音，再触发一次停止录音并识别，把识别结果粘贴到当前输入框。支持两种触发方式：
+
+- **Ubuntu 自定义快捷键**（默认，向后兼容）：快捷键指向本程序，无参数运行即可。
+- **常驻守护进程**（`--daemon`）：后台运行，自带全局热键 + 系统托盘 + 图形设置页，模型只加载一次，触发更快。
+
+两种方式可同时使用——开了守护进程后，原来的 Ubuntu 快捷键会自动通过 socket 转发给守护进程，复用已加载的模型而变快。
 
 支持两种识别引擎：
 - **sherpa（推荐）**：本地三模型 pipeline，完全离线，边录边识别
@@ -218,6 +223,56 @@ Settings -> Keyboard -> Keyboard Shortcuts -> Custom Shortcuts
 1. 把光标放到目标输入框
 2. 按一次快捷键开始录音
 3. 再按一次快捷键停止录音并自动输入
+
+无参数运行时，程序会先探测是否有守护进程在跑：
+
+- 有：把 toggle 转发给守护进程，复用已加载的模型（快），随即退出。
+- 没有：退化为独立的一次性进程，加载模型 → 录音 → 识别 → 粘贴 → 退出（即旧行为）。
+
+因此现有的 Ubuntu 快捷键无需任何改动即可继续工作。
+
+## 守护进程模式（托盘 + 全局热键）
+
+用 `--daemon` 启动常驻后台进程：
+
+```bash
+./linux-voice-input --daemon
+```
+
+启动后：
+
+- 模型只加载一次并常驻复用，触发识别更快。
+- 注册全局热键（默认 `alt+shift+g`），按一次开始录音、再按一次停止并输入。
+- 系统托盘菜单：
+  - 状态显示（空闲 / 录音中…）
+  - `启用热键监听`（勾选切换，立即生效并保存）
+  - `打开设置…`（图形化配置引擎、API Key、热键、通知开关等，保存即热重载并重绑热键）
+  - `退出`
+- 关闭设置窗口只是隐藏，进程继续在后台运行。
+
+守护进程运行时，原有的 Ubuntu 快捷键会自动通过 socket 转发给它，两种触发方式并存。
+
+### GNOME 托盘图标不显示
+
+GNOME 默认不显示系统托盘。若看不到托盘图标，安装并启用 AppIndicator 扩展：
+
+```bash
+sudo apt install -y gnome-shell-extension-appindicator
+```
+
+安装后在 GNOME Extensions（“扩展”）中启用 “AppIndicator and KStatusNotifierItem Support”，然后重新登录。
+
+### 开机自启
+
+创建 `~/.config/autostart/linux-voice-input.desktop`：
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=Linux Voice Input
+Exec=/path/to/linux-voice-input --daemon
+X-GNOME-Autostart-enabled=true
+```
 
 ## 桌面通知
 

@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -16,13 +15,13 @@ import (
 	"linux-voice-input/api"
 	"linux-voice-input/audio"
 	"linux-voice-input/config"
-	"linux-voice-input/input"
+	"linux-voice-input/doctor"
+	"linux-voice-input/models"
+	"linux-voice-input/session"
+	"linux-voice-input/ui"
 )
 
-const (
-	socketName           = "linux-voice-input.sock"
-	minRecordingDuration = time.Second
-)
+const socketName = "linux-voice-input.sock"
 
 func socketPath() string {
 	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
@@ -32,184 +31,26 @@ func socketPath() string {
 	return filepath.Join(runtimeDir, socketName)
 }
 
-func sendStopIfRunning(sock string) bool {
+// sendCommand connects to a running instance (daemon or standalone recorder)
+// and sends a single command. It returns true if a listener accepted it.
+func sendCommand(sock, command string) bool {
 	conn, err := net.DialTimeout("unix", sock, 200*time.Millisecond)
 	if err != nil {
 		return false
 	}
 	defer conn.Close()
 
-	_, _ = io.WriteString(conn, "stop\n")
+	_, _ = io.WriteString(conn, command+"\n")
 	return true
 }
 
-func listenForStop(sock string) (net.Listener, error) {
+func listenSocket(sock string) (net.Listener, error) {
 	_ = os.Remove(sock)
 	listener, err := net.Listen("unix", sock)
 	if err != nil {
 		return nil, err
 	}
 	return listener, nil
-}
-
-func notifyIDPath() string {
-	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
-	if runtimeDir == "" {
-		runtimeDir = os.TempDir()
-	}
-	return filepath.Join(runtimeDir, "linux-voice-input.notify-id")
-}
-
-func readNotifyID() string {
-	data, err := os.ReadFile(notifyIDPath())
-	if err != nil {
-		return "0"
-	}
-	id := strings.TrimSpace(string(data))
-	if id == "" {
-		return "0"
-	}
-	return id
-}
-
-func writeNotifyID(id string) {
-	if id == "" || id == "0" {
-		return
-	}
-	if err := os.WriteFile(notifyIDPath(), []byte(id), 0644); err != nil {
-		log.Printf("write notification id failed: %v", err)
-	}
-}
-
-func notify(summary, body string, final bool) {
-	id, err := notifyDBus(summary, body, readNotifyID())
-	if err != nil {
-		log.Printf("dbus notify failed: %v", err)
-		cmd := exec.Command("notify-send", "--app-name=Linux Voice Input", "--expire-time=3000", "--hint=boolean:transient:true", summary, body)
-		if err := cmd.Run(); err != nil {
-			log.Printf("notify-send failed: %v", err)
-		}
-		return
-	}
-
-	writeNotifyID(id)
-	if final {
-		closeNotificationLater(id)
-	}
-}
-
-func notifyIf(enabled bool, summary, body string, final bool) {
-	if enabled {
-		notify(summary, body, final)
-	}
-}
-
-func notifyFinalIf(enabled bool, summary, body string) {
-	if enabled {
-		notify(summary, body, true)
-		return
-	}
-	closeCurrentNotificationLater()
-}
-
-func notifyPersistent(summary, body string) {
-	id, err := notifyDBusPersistent(summary, body, readNotifyID())
-	if err != nil {
-		log.Printf("dbus persistent notify failed: %v", err)
-		return
-	}
-	writeNotifyID(id)
-}
-
-func closeCurrentNotificationLater() {
-	id := readNotifyID()
-	if id != "0" {
-		closeNotificationLater(id)
-	}
-}
-
-func closeNotificationLater(id string) {
-	cmd := exec.Command(
-		"sh", "-c",
-		"sleep 3; gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.CloseNotification \"$1\" >/dev/null 2>&1; rm -f \"$2\"",
-		"sh", id, notifyIDPath(),
-	)
-	if err := cmd.Start(); err != nil {
-		log.Printf("schedule close notification failed: %v", err)
-	}
-}
-
-func notifyDBus(summary, body, replacesID string) (string, error) {
-	return notifyDBusWithTimeout(summary, body, replacesID, "3000")
-}
-
-func notifyDBusPersistent(summary, body, replacesID string) (string, error) {
-	out, err := exec.Command(
-		"gdbus", "call",
-		"--session",
-		"--dest", "org.freedesktop.Notifications",
-		"--object-path", "/org/freedesktop/Notifications",
-		"--method", "org.freedesktop.Notifications.Notify",
-		"Linux Voice Input",
-		replacesID,
-		"",
-		summary,
-		body,
-		"[]",
-		"{'urgency': <byte 2>, 'resident': <true>}",
-		"0",
-	).Output()
-	if err != nil {
-		return "", err
-	}
-
-	result := strings.TrimSpace(string(out))
-	id := strings.Trim(result, "(), ")
-	id = strings.TrimPrefix(id, "uint32 ")
-	if id == "" {
-		return "", fmt.Errorf("empty notification id from %q", result)
-	}
-	return id, nil
-}
-
-func notifyDBusWithTimeout(summary, body, replacesID, timeoutMs string) (string, error) {
-	out, err := exec.Command(
-		"gdbus", "call",
-		"--session",
-		"--dest", "org.freedesktop.Notifications",
-		"--object-path", "/org/freedesktop/Notifications",
-		"--method", "org.freedesktop.Notifications.Notify",
-		"Linux Voice Input",
-		replacesID,
-		"",
-		summary,
-		body,
-		"[]",
-		"{'transient': <true>}",
-		timeoutMs,
-	).Output()
-	if err != nil {
-		return "", err
-	}
-
-	result := strings.TrimSpace(string(out))
-	id := strings.Trim(result, "(), ")
-	id = strings.TrimPrefix(id, "uint32 ")
-	if id == "" {
-		return "", fmt.Errorf("empty notification id from %q", result)
-	}
-	return id, nil
-}
-
-func closeNotification(id string) error {
-	return exec.Command(
-		"gdbus", "call",
-		"--session",
-		"--dest", "org.freedesktop.Notifications",
-		"--object-path", "/org/freedesktop/Notifications",
-		"--method", "org.freedesktop.Notifications.CloseNotification",
-		id,
-	).Run()
 }
 
 func logDir() string {
@@ -274,12 +115,14 @@ func main() {
 		defer logFile.Close()
 	}
 
-	testMode := len(os.Args) > 1 && os.Args[1] == "--test"
+	mode := parseMode(os.Args[1:])
 
-	if !testMode {
-		sock := socketPath()
-		if sendStopIfRunning(sock) {
-			log.Println("Sent stop command to running instance")
+	// For the toggle (no-arg) path, probe for a running instance before
+	// loading any config or models: if the daemon (or a standalone recorder)
+	// is listening, just forward a toggle and exit immediately.
+	if mode == modeToggle {
+		if sendCommand(socketPath(), "toggle") {
+			log.Println("Forwarded toggle to running instance")
 			return
 		}
 	}
@@ -291,13 +134,23 @@ func main() {
 
 	log.Printf("Config file: %s", config.ConfigPath())
 	log.Printf("Engine: %s", cfg.API.Engine)
+
+	// The utility subcommands do not need a working engine, so handle them
+	// before the whisper API-key gate below.
+	switch mode {
+	case modeDownloadModels:
+		runDownloadModels(cfg)
+		return
+	case modeCheckConfig:
+		runCheckConfig(cfg)
+		return
+	}
+
 	if cfg.API.Engine == "sherpa" {
 		log.Printf("Sherpa encoder: %s", cfg.Sherpa.Encoder)
-		log.Printf("Sherpa decoder: %s", cfg.Sherpa.Decoder)
-		log.Printf("Sherpa tokens: %s", cfg.Sherpa.Tokens)
 		log.Printf("Sherpa threads: %d", cfg.Sherpa.NumThreads)
 	} else {
-		if cfg.API.Key == "" {
+		if cfg.API.Key == "" && mode != modeDaemon {
 			fmt.Printf("请先配置 API Key，编辑配置文件: %s\n", config.ConfigPath())
 			os.Exit(1)
 		}
@@ -305,12 +158,198 @@ func main() {
 		log.Printf("API model: %s", cfg.API.Model)
 	}
 
-	if testMode {
+	switch mode {
+	case modeTest:
 		runTestMode(cfg)
-		return
+	case modeDaemon:
+		runDaemon(cfg)
+	default:
+		runStandalone(cfg)
+	}
+}
+
+// runDownloadModels downloads any missing sherpa model bundles into the
+// configured model directory, printing progress to stdout. Shares the same
+// entry point (models.DownloadMissing) as the settings window button.
+func runDownloadModels(cfg *config.Config) {
+	baseDir := cfg.Sherpa.ModelDir
+	if baseDir == "" {
+		baseDir = config.DefaultModelDir()
+	}
+	fmt.Printf("模型目录: %s\n", baseDir)
+	err := models.DownloadMissing(baseDir, func(msg string) {
+		fmt.Println(msg)
+	})
+	if err != nil {
+		fmt.Printf("下载失败: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// runCheckConfig runs the doctor environment/configuration checks and prints a
+// report, exiting non-zero if any check failed. Shares the same entry point
+// (doctor.Run) as the settings window button.
+func runCheckConfig(cfg *config.Config) {
+	results := doctor.Run(cfg)
+	fmt.Println("配置与环境检查:")
+	for _, r := range results {
+		mark := "✓"
+		if !r.OK {
+			mark = "✗"
+		}
+		fmt.Printf("  [%s] %s: %s\n", mark, r.Name, r.Detail)
+	}
+	if !doctor.AllOK(results) {
+		fmt.Println("\n存在问题，请按上面提示处理。")
+		os.Exit(1)
+	}
+	fmt.Println("\n全部检查通过。")
+}
+
+type runMode int
+
+const (
+	modeToggle runMode = iota
+	modeDaemon
+	modeTest
+	modeDownloadModels
+	modeCheckConfig
+)
+
+func parseMode(args []string) runMode {
+	for _, arg := range args {
+		switch arg {
+		case "--test":
+			return modeTest
+		case "--daemon":
+			return modeDaemon
+		case "--download-models":
+			return modeDownloadModels
+		case "--check-config":
+			return modeCheckConfig
+		}
+	}
+	return modeToggle
+}
+
+// runStandalone reproduces the original one-shot behavior for when no daemon is
+// running: the first invocation records and listens on the socket; a second
+// invocation forwards a toggle that stops this recording. Models are loaded on
+// demand and released when the process exits.
+func runStandalone(cfg *config.Config) {
+	sock := socketPath()
+
+	listener, err := listenSocket(sock)
+	if err != nil {
+		log.Fatalf("Failed to create socket: %v", err)
+	}
+	defer func() {
+		listener.Close()
+		os.Remove(sock)
+	}()
+
+	if err := audio.Init(); err != nil {
+		log.Fatalf("Failed to initialize audio: %v", err)
+	}
+	defer audio.Terminate()
+
+	controller := session.New(cfg)
+	defer controller.Close()
+
+	if err := controller.StartRecording(); err != nil {
+		log.Fatalf("Failed to start recording: %v", err)
 	}
 
-	runNormalMode(cfg)
+	stopCh := make(chan struct{})
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 64)
+		n, _ := conn.Read(buf)
+		cmd := strings.TrimSpace(string(buf[:n]))
+		// Any recognized command (toggle/stop) ends this one-shot recording.
+		if cmd == "toggle" || cmd == "stop" {
+			close(stopCh)
+		}
+	}()
+
+	select {
+	case <-stopCh:
+		log.Println("Stop command received")
+	case <-sigCh:
+		log.Println("Signal received, stopping")
+	}
+
+	controller.StopAndTranscribe()
+}
+
+// runDaemon starts the resident background process: it preloads models, listens
+// on the socket for forwarded toggles, registers the global hotkey, and runs
+// the fyne app with a system tray and settings window.
+func runDaemon(cfg *config.Config) {
+	sock := socketPath()
+
+	listener, err := listenSocket(sock)
+	if err != nil {
+		log.Fatalf("Failed to create socket (is a daemon already running?): %v", err)
+	}
+	defer func() {
+		listener.Close()
+		os.Remove(sock)
+	}()
+
+	if err := audio.Init(); err != nil {
+		log.Fatalf("Failed to initialize audio: %v", err)
+	}
+	defer audio.Terminate()
+
+	controller := session.New(cfg)
+	defer controller.Close()
+	if err := controller.Preload(); err != nil {
+		log.Printf("Model preload failed (will retry lazily): %v", err)
+	}
+
+	go acceptToggleLoop(listener, controller)
+
+	app := ui.NewApp(cfg, controller)
+	go handleSignals(app)
+
+	app.Run()
+	log.Println("Daemon exiting")
+}
+
+// acceptToggleLoop serves the daemon's remote-control socket. Each accepted
+// connection sends one command; "toggle" drives the shared controller.
+func acceptToggleLoop(listener net.Listener, controller *session.Controller) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			buf := make([]byte, 64)
+			n, _ := c.Read(buf)
+			cmd := strings.TrimSpace(string(buf[:n]))
+			if cmd == "toggle" || cmd == "stop" {
+				controller.Toggle()
+			}
+		}(conn)
+	}
+}
+
+func handleSignals(app *ui.App) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+	log.Println("Signal received, quitting daemon")
+	app.Quit()
 }
 
 func runTestMode(cfg *config.Config) {
@@ -407,164 +446,4 @@ func runTestMode(cfg *config.Config) {
 	} else {
 		fmt.Printf("[TEST] 识别结果: %s\n", text)
 	}
-}
-
-func runNormalMode(cfg *config.Config) {
-	sock := socketPath()
-
-	listener, err := listenForStop(sock)
-	if err != nil {
-		log.Fatalf("Failed to create socket: %v", err)
-	}
-	defer func() {
-		listener.Close()
-		os.Remove(sock)
-	}()
-
-	if err := audio.Init(); err != nil {
-		log.Fatalf("Failed to initialize audio: %v", err)
-	}
-	defer audio.Terminate()
-
-	targetWindow := input.GetActiveWindow()
-	log.Printf("Target window: %s", targetWindow)
-
-	recorder := audio.NewRecorder(cfg.Audio.SampleRate)
-
-	log.Println("Recording started. Run the command again to stop.")
-	if err := recorder.Start(); err != nil {
-		notifyFinalIf(cfg.Notifications.RecordStartFailed, "语音输入", "录音启动失败")
-		log.Fatalf("Failed to start recording: %v", err)
-	}
-	notifyIf(cfg.Notifications.Start, "语音输入", "录音中", false)
-	start := time.Now()
-
-	// Start streaming recognition in background if using sherpa engine
-	var sherpaStream *api.SherpaStream
-	var sherpaRecognizer *api.SherpaStreamRecognizer
-	if cfg.API.Engine == "sherpa" {
-		sherpaRecognizer, err = api.NewSherpaStreamRecognizer(cfg.Sherpa)
-		if err != nil {
-			notifyFinalIf(cfg.Notifications.TranscribeFailed, "语音输入", "识别引擎初始化失败")
-			log.Fatalf("Failed to create sherpa recognizer: %v", err)
-		}
-		defer sherpaRecognizer.Close()
-
-		sherpaStream = sherpaRecognizer.CreateStream()
-		defer sherpaStream.Close()
-
-		go func() {
-			for samples := range recorder.AudioStream {
-				sherpaStream.FeedAudio(samples)
-				partialText := sherpaStream.GetPartialResult()
-				if partialText != "" && cfg.Notifications.Start {
-					notifyPersistent("语音输入", "录音中: "+partialText)
-				}
-			}
-		}()
-	}
-
-	stopCh := make(chan struct{})
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		buf := make([]byte, 64)
-		n, _ := conn.Read(buf)
-		cmd := strings.TrimSpace(string(buf[:n]))
-		if cmd == "stop" {
-			close(stopCh)
-		}
-	}()
-
-	select {
-	case <-stopCh:
-		log.Println("Stop command received")
-	case <-sigCh:
-		log.Println("Signal received, stopping")
-	}
-
-	duration := time.Since(start)
-	log.Printf("Recording stopped, duration: %02d:%02d", int(duration.Seconds())/60, int(duration.Seconds())%60)
-
-	log.Println("Stopping audio stream...")
-	if err := recorder.Stop(); err != nil {
-		notifyFinalIf(cfg.Notifications.RecordStopFailed, "语音输入", "录音停止失败")
-		log.Fatalf("Failed to stop recording: %v", err)
-	}
-
-	if duration < minRecordingDuration {
-		log.Printf("Recording ignored because duration %.3fs is shorter than %.3fs", duration.Seconds(), minRecordingDuration.Seconds())
-		notifyFinalIf(cfg.Notifications.Ignored, "语音输入", "录音过短，已忽略")
-		return
-	}
-
-	var text string
-	if cfg.API.Engine == "sherpa" {
-		log.Println("Finalizing with offline model for better accuracy...")
-		startTime := time.Now()
-		offlineRecognizer, offlineErr := api.NewSherpaOfflineRecognizer(cfg.Sherpa)
-		if offlineErr != nil {
-			log.Printf("Offline model unavailable, falling back to streaming result: %v", offlineErr)
-			text = sherpaStream.Finish()
-		} else {
-			defer offlineRecognizer.Close()
-			samples := recorder.GetSamplesFloat32()
-			text, _ = offlineRecognizer.TranscribeAudioSamples(samples)
-			log.Printf("Offline recognition done in %dms: %s", time.Since(startTime).Milliseconds(), text)
-		}
-
-		if text != "" && cfg.Sherpa.PunctModel != "" {
-			log.Println("Adding punctuation...")
-			startTime = time.Now()
-			punct, punctErr := api.NewSherpaPunctuation(cfg.Sherpa.PunctModel)
-			if punctErr != nil {
-				log.Printf("Punctuation model unavailable: %v", punctErr)
-			} else {
-				defer punct.Close()
-				text = punct.AddPunct(text)
-				log.Printf("Punctuation done in %dms: %s", time.Since(startTime).Milliseconds(), text)
-			}
-		}
-	} else {
-		notifyIf(cfg.Notifications.Start, "语音输入", "识别中", false)
-
-		tmpFile := filepath.Join(os.TempDir(), "linux-voice-input.wav")
-		log.Println("Saving WAV...")
-		if err := recorder.SaveWAV(tmpFile); err != nil {
-			notifyFinalIf(cfg.Notifications.SaveFailed, "语音输入", "保存录音失败")
-			log.Fatalf("Failed to save WAV: %v", err)
-		}
-		defer os.Remove(tmpFile)
-
-		log.Println("Calling transcription API...")
-		apiClient := api.NewClient(cfg.API.BaseURL, cfg.API.Key, cfg.API.Model)
-		text, err = apiClient.Transcribe(tmpFile)
-		if err != nil {
-			notifyFinalIf(cfg.Notifications.TranscribeFailed, "语音输入", "识别失败")
-			log.Fatalf("Transcription failed: %v", err)
-		}
-	}
-
-	if text == "" {
-		notifyFinalIf(cfg.Notifications.EmptyResult, "语音输入", "未识别到内容")
-		log.Println("Empty transcription result")
-		return
-	}
-
-	log.Printf("Transcribed: %s", text)
-	log.Printf("Pasting to window: %s", targetWindow)
-
-	if err := input.PasteText(text, cfg.RestoreClipboard, targetWindow); err != nil {
-		notifyFinalIf(cfg.Notifications.PasteFailed, "语音输入", "粘贴失败")
-		log.Fatalf("Failed to paste: %v", err)
-	}
-
-	notifyFinalIf(cfg.Notifications.Success, "语音输入", "已输入："+text)
-	log.Println("Done")
 }

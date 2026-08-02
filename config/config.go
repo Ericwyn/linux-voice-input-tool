@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 
 	"gopkg.in/yaml.v3"
+
+	"linux-voice-input/models"
 )
 
 type APIConfig struct {
@@ -15,6 +17,10 @@ type APIConfig struct {
 }
 
 type SherpaConfig struct {
+	// ModelDir is the single base directory that holds all sherpa model
+	// bundles. When set, the six concrete paths below are derived from it, so
+	// users only need to configure one path.
+	ModelDir                string  `yaml:"model_dir"`
 	Encoder                 string  `yaml:"encoder"`
 	Decoder                 string  `yaml:"decoder"`
 	Tokens                  string  `yaml:"tokens"`
@@ -48,24 +54,27 @@ type Config struct {
 	Audio            AudioConfig         `yaml:"audio"`
 	Notifications    NotificationsConfig `yaml:"notifications"`
 	RestoreClipboard bool                `yaml:"restore_clipboard"`
+	// Hotkey is the global hotkey combination that toggles recording,
+	// e.g. "alt+shift+g". Modifiers: ctrl/alt/shift/super.
+	Hotkey string `yaml:"hotkey"`
+	// HotkeyEnabled controls whether the global hotkey listener is active
+	// when the daemon starts. It can be toggled at runtime from the tray.
+	HotkeyEnabled bool `yaml:"hotkey_enabled"`
 }
 
-func defaultModelDir() string {
+// DefaultModelDir returns the base directory that holds all sherpa model
+// bundles: ~/.linux-voice-input/models.
+func DefaultModelDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ""
+		return "models"
 	}
-	return filepath.Join(home, ".linux-voice-input", "models",
-		"sherpa-onnx-streaming-paraformer-bilingual-zh-en")
+	return filepath.Join(home, ".linux-voice-input", "models")
 }
 
 func DefaultConfig() *Config {
-	modelDir := defaultModelDir()
-	home, _ := os.UserHomeDir()
-	offlineModelDir := filepath.Join(home, ".linux-voice-input", "models",
-		"sherpa-onnx-paraformer-zh-2023-09-14")
-	punctModelDir := filepath.Join(home, ".linux-voice-input", "models",
-		"sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12")
+	baseDir := DefaultModelDir()
+	paths := models.Paths(baseDir)
 	return &Config{
 		API: APIConfig{
 			Engine:  "sherpa",
@@ -74,15 +83,16 @@ func DefaultConfig() *Config {
 			Model:   "FunAudioLLM/SenseVoiceSmall",
 		},
 		Sherpa: SherpaConfig{
-			Encoder:                 filepath.Join(modelDir, "encoder.int8.onnx"),
-			Decoder:                 filepath.Join(modelDir, "decoder.int8.onnx"),
-			Tokens:                  filepath.Join(modelDir, "tokens.txt"),
+			ModelDir:                baseDir,
+			Encoder:                 paths.Encoder,
+			Decoder:                 paths.Decoder,
+			Tokens:                  paths.Tokens,
 			NumThreads:              4,
 			Rule1MinTrailingSilence: 2.4,
 			Rule2MinTrailingSilence: 1.2,
-			OfflineModel:            filepath.Join(offlineModelDir, "model.int8.onnx"),
-			OfflineTokens:           filepath.Join(offlineModelDir, "tokens.txt"),
-			PunctModel:              filepath.Join(punctModelDir, "model.onnx"),
+			OfflineModel:            paths.OfflineModel,
+			OfflineTokens:           paths.OfflineTokens,
+			PunctModel:              paths.PunctModel,
 		},
 		Audio: AudioConfig{
 			SampleRate: 16000,
@@ -99,6 +109,8 @@ func DefaultConfig() *Config {
 			PasteFailed:       true,
 		},
 		RestoreClipboard: true,
+		Hotkey:           "alt+shift+g",
+		HotkeyEnabled:    true,
 	}
 }
 
@@ -122,6 +134,23 @@ func legacyConfigPath() string {
 	return filepath.Join(home, ".config", "linux-voice-input", "config.yaml")
 }
 
+// ResolveModelPaths derives the six sherpa file paths from ModelDir when it is
+// set, making the single directory the source of truth. Explicit per-file
+// paths in the config are overridden. If ModelDir is empty (e.g. a legacy
+// config), the existing explicit paths are kept as-is.
+func (c *Config) ResolveModelPaths() {
+	if c.Sherpa.ModelDir == "" {
+		return
+	}
+	paths := models.Paths(c.Sherpa.ModelDir)
+	c.Sherpa.Encoder = paths.Encoder
+	c.Sherpa.Decoder = paths.Decoder
+	c.Sherpa.Tokens = paths.Tokens
+	c.Sherpa.OfflineModel = paths.OfflineModel
+	c.Sherpa.OfflineTokens = paths.OfflineTokens
+	c.Sherpa.PunctModel = paths.PunctModel
+}
+
 func Load() (*Config, error) {
 	cfg := DefaultConfig()
 
@@ -130,6 +159,7 @@ func Load() (*Config, error) {
 		if err := yaml.Unmarshal(data, cfg); err != nil {
 			return nil, err
 		}
+		cfg.ResolveModelPaths()
 		return cfg, nil
 	}
 	if !os.IsNotExist(err) {
@@ -143,6 +173,7 @@ func Load() (*Config, error) {
 			if err := yaml.Unmarshal(data, cfg); err != nil {
 				return nil, err
 			}
+			cfg.ResolveModelPaths()
 			if err := Save(cfg); err != nil {
 				return nil, err
 			}

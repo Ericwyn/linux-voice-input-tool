@@ -73,6 +73,15 @@ func (h *Handler) Bind(hotkey string) error {
 	return nil
 }
 
+// Unbind detaches all key callbacks and ungrabs any grabbed keys on the root
+// window, so the hotkey stops firing. The event loop (Listen) can keep running.
+func (h *Handler) Unbind() {
+	root := h.xu.RootWin()
+	keybind.Detach(h.xu, root)
+	// AnyKey (0) + AnyModifier releases every grab this process holds on root.
+	xproto.UngrabKey(h.xu.Conn(), 0, root, xproto.ModMaskAny)
+}
+
 // GrabKeyboard grabs keyboard to detect release of modifier keys
 func (h *Handler) GrabKeyboard() {
 	xproto.GrabKeyboard(h.xu.Conn(), true, h.xu.RootWin(),
@@ -89,4 +98,12 @@ func (h *Handler) Listen() {
 
 func (h *Handler) Stop() {
 	xevent.Quit(h.xu)
+}
+
+// Close closes the underlying X connection. After Close the handler must not be
+// used again.
+func (h *Handler) Close() {
+	if h.xu != nil {
+		h.xu.Conn().Close()
+	}
 }
