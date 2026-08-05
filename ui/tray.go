@@ -4,6 +4,7 @@ import (
 	"github.com/gogpu/systray"
 
 	"linux-voice-input/assets"
+	"linux-voice-input/version"
 )
 
 // setupTray builds the system tray icon and its context menu, storing handles to
@@ -20,6 +21,7 @@ import (
 //	---
 //	打开配置目录 / 重载配置
 //	---
+//	Linux Voice Input x.y.z    (disabled; shows the running version)
 //	退出
 //
 // All click callbacks run on gogpu/systray's D-Bus goroutine; handlers that do
@@ -64,6 +66,11 @@ func (a *App) setupTray() {
 	menu.Add("重载配置", func() { a.reloadConfig() })
 
 	menu.AddSeparator()
+
+	// Version line: a disabled, non-clickable informational item so users can
+	// see the running version without opening a terminal.
+	versionItem := menu.Add("v" + version.Version, nil)
+	versionItem.SetDisabled(true)
 
 	menu.Add("退出", func() { a.Quit() })
 
