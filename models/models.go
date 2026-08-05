@@ -6,6 +6,7 @@ package models
 import (
 	"archive/tar"
 	"compress/bzip2"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -231,7 +232,13 @@ func (r *progressReader) Read(p []byte) (int, error) {
 // non-nil, is called with byte-level download progress for the CLI/UI to render
 // speed and percentage. Models already present are skipped. A nil/empty set
 // (e.g. an engine with no local models) is a no-op.
-func DownloadMissing(baseDir string, set []Model, status func(string), progress func(DownloadProgress)) error {
+//
+// Cancelling ctx aborts the in-flight transfer promptly: the underlying HTTP
+// request is bound to ctx, so an in-progress read returns a context error, and
+// the caller receives that error wrapped. A partially written file for the
+// interrupted model is left on disk; because Check/modelPresent treat an
+// incomplete bundle as missing, a later download simply retries it.
+func DownloadMissing(ctx context.Context, baseDir string, set []Model, status func(string), progress func(DownloadProgress)) error {
 	report := func(format string, args ...interface{}) {
 		if status != nil {
 			status(fmt.Sprintf(format, args...))
@@ -243,12 +250,15 @@ func DownloadMissing(baseDir string, set []Model, status func(string), progress 
 	}
 
 	for _, model := range set {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if modelPresent(baseDir, model) {
 			report("已存在，跳过: %s", model.Label)
 			continue
 		}
 		report("开始下载: %s", model.Label)
-		if err := downloadAndExtract(model.URL, baseDir, model.Label, progress); err != nil {
+		if err := downloadAndExtract(ctx, model.URL, baseDir, model.Label, progress); err != nil {
 			return fmt.Errorf("download %s: %w", model.Label, err)
 		}
 		report("完成: %s", model.Label)
@@ -316,8 +326,9 @@ func RuntimeLibrariesPresent(libDir string) bool {
 // DownloadRuntimeLibrary downloads the sherpa-onnx shared-library bundle and
 // extracts the required .so files (flattened by base name) into libDir. If the
 // libraries are already present it is a no-op. status/progress mirror
-// DownloadMissing's callbacks for CLI/UI reporting.
-func DownloadRuntimeLibrary(libDir string, status func(string), progress func(DownloadProgress)) error {
+// DownloadMissing's callbacks for CLI/UI reporting. Cancelling ctx aborts the
+// in-flight transfer the same way DownloadMissing does.
+func DownloadRuntimeLibrary(ctx context.Context, libDir string, status func(string), progress func(DownloadProgress)) error {
 	report := func(format string, args ...interface{}) {
 		if status != nil {
 			status(fmt.Sprintf(format, args...))
@@ -339,7 +350,7 @@ func DownloadRuntimeLibrary(libDir string, status func(string), progress func(Do
 	}
 
 	report("开始下载: %s", sherpaRuntimeLibrary.Label)
-	if err := downloadAndExtractFiles(sherpaRuntimeLibrary.URL, libDir, sherpaRuntimeLibrary.Label, wanted, progress); err != nil {
+	if err := downloadAndExtractFiles(ctx, sherpaRuntimeLibrary.URL, libDir, sherpaRuntimeLibrary.Label, wanted, progress); err != nil {
 		return fmt.Errorf("download %s: %w", sherpaRuntimeLibrary.Label, err)
 	}
 
@@ -353,8 +364,8 @@ func DownloadRuntimeLibrary(libDir string, status func(string), progress func(Do
 // downloadAndExtract streams a .tar.bz2 from url and extracts it into destDir.
 // When progress is non-nil, the compressed download stream is wrapped so speed
 // and percentage can be reported as bytes arrive, plus a final 100% report.
-func downloadAndExtract(url, destDir, label string, progress func(DownloadProgress)) error {
-	resp, tracker, err := openDownloadStream(url, label, progress)
+func downloadAndExtract(ctx context.Context, url, destDir, label string, progress func(DownloadProgress)) error {
+	resp, tracker, err := openDownloadStream(ctx, url, label, progress)
 	if err != nil {
 		return err
 	}
@@ -408,8 +419,8 @@ func downloadAndExtract(url, destDir, label string, progress func(DownloadProgre
 // for the shared-library bundle, whose .so files live under an inner directory
 // but must land flat in the target lib directory. Progress reporting matches
 // downloadAndExtract.
-func downloadAndExtractFiles(url, destDir, label string, wanted map[string]bool, progress func(DownloadProgress)) error {
-	resp, tracker, err := openDownloadStream(url, label, progress)
+func downloadAndExtractFiles(ctx context.Context, url, destDir, label string, wanted map[string]bool, progress func(DownloadProgress)) error {
+	resp, tracker, err := openDownloadStream(ctx, url, label, progress)
 	if err != nil {
 		return err
 	}
@@ -456,9 +467,13 @@ func downloadAndExtractFiles(url, destDir, label string, wanted map[string]bool,
 // openDownloadStream performs the HTTP GET and, when progress is non-nil, wraps
 // the response body in a progressReader so byte-level speed/percentage can be
 // reported as the compressed stream arrives. The caller must close resp.Body.
-func openDownloadStream(url, label string, progress func(DownloadProgress)) (*http.Response, *progressReader, error) {
+func openDownloadStream(ctx context.Context, url, label string, progress func(DownloadProgress)) (*http.Response, *progressReader, error) {
 	client := &http.Client{Timeout: 30 * time.Minute}
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -329,6 +329,53 @@ func (c *Controller) StopAndTranscribe() {
 	log.Println("Done")
 }
 
+// Cancel aborts the active recording without transcribing or pasting: it stops
+// the recorder, drains and closes the recognition session, releases the
+// system-wide recording lock, and tears down the live-preview bubble silently
+// (no result/error notification). It mirrors StopAndTranscribe's teardown so no
+// resource leaks, but deliberately skips recognition and paste. It is a no-op
+// when no recording is in progress, and is safe to call from the tray or from a
+// notification "取消" action.
+func (c *Controller) Cancel() {
+	c.mu.Lock()
+	if !c.recording {
+		c.mu.Unlock()
+		return
+	}
+
+	recorder := c.recorder
+	activeSession := c.activeSession
+	feedDone := c.feedDone
+	lock := c.lock
+
+	c.recording = false
+	c.recorder = nil
+	c.activeSession = nil
+	c.feedDone = nil
+	c.lock = nil
+	c.mu.Unlock()
+
+	go c.notifyStateChange(false)
+
+	// Silently drop the live-preview bubble; a cancel shows no result bubble.
+	notify.EndPreview()
+
+	if err := recorder.Stop(); err != nil {
+		log.Printf("Cancel: stop recording failed: %v", err)
+	}
+	// Drain the feeding goroutine before closing the session so the closed
+	// audio stream is fully consumed and Close is safe.
+	if feedDone != nil {
+		<-feedDone
+	}
+	if activeSession != nil {
+		activeSession.Close()
+	}
+	lock.release()
+
+	log.Println("Recording cancelled")
+}
+
 // transcribe drives the session to produce the final text. For engines without
 // live preview (e.g. whisper) it emits a "recognizing" notification first,
 // since there was no preview during recording. A recognition error is reported

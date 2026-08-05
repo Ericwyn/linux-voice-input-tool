@@ -1,25 +1,36 @@
-// Package ui hosts the fyne desktop application for daemon mode: a system tray,
-// a settings window, and the global hotkey lifecycle. The recording pipeline
+// Package ui hosts the daemon-mode system tray built on gogpu/systray, plus the
+// global hotkey lifecycle. All user-facing configuration is done by editing the
+// config file and reloading it from the tray; there is no settings window.
+// Long-running side tasks (model download, environment check) report progress
+// through desktop notifications rather than windows. The recording pipeline
 // itself lives in the session package; this package only orchestrates it.
 package ui
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"log"
+	"os/exec"
+	"strings"
 	"sync"
 
-	"fyne.io/fyne/v2"
-	fyneapp "fyne.io/fyne/v2/app"
+	"github.com/gogpu/systray"
 
-	"linux-voice-input/assets"
 	"linux-voice-input/config"
+	"linux-voice-input/doctor"
 	"linux-voice-input/hotkey"
+	"linux-voice-input/models"
+	"linux-voice-input/notify"
 	"linux-voice-input/session"
 )
 
-// App wires together the fyne application, system tray, settings window,
-// global hotkey handler, and the shared session controller.
+// engineNames is the fixed set of selectable engines, in tray display order.
+var engineNames = []string{"sensevoice", "sherpa", "whisper"}
+
+// App wires together the system tray, global hotkey handler, and the shared
+// session controller.
 type App struct {
-	fyneApp    fyne.App
 	controller *session.Controller
 
 	mu            sync.Mutex
@@ -27,38 +38,44 @@ type App struct {
 	hotkeyHandler *hotkey.Handler
 	hotkeyBound   bool
 
-	settingsWindow fyne.Window
+	// tray and the menu-item handles are created in setupTray and updated live
+	// from menu callbacks and the recording state-change callback.
+	tray         *systray.SystemTray
+	statusItem   *systray.MenuItem
+	hotkeyItem   *systray.MenuItem
+	engineItems  map[string]*systray.MenuItem
+	downloadItem *systray.MenuItem
 
-	// updateTrayStatus is set by setupTray to reflect recording state; it is
-	// always invoked on the fyne main goroutine.
-	updateTrayStatus func(recording bool)
+	// downloadMu guards downloadCancel, which is non-nil exactly while a model
+	// download is in flight. Cancelling it aborts the transfer; the download
+	// goroutine clears it and restores the menu label when it returns. It is a
+	// separate lock from mu so a click can query download state without
+	// contending on the config lock.
+	downloadMu     sync.Mutex
+	downloadCancel context.CancelFunc
 }
 
-// NewApp constructs the daemon UI. It initializes the global hotkey handler,
-// builds the tray and settings window, and binds the hotkey if enabled.
+// NewApp constructs the daemon UI: it initializes the global hotkey handler,
+// builds the tray menu, wires the recording state-change callback, and registers
+// the notification "取消" action so clicking it cancels the active recording.
 func NewApp(cfg *config.Config, controller *session.Controller) *App {
-	fyneApplication := fyneapp.NewWithID("com.github.linux-voice-input")
-	fyneApplication.SetIcon(assets.AppIcon)
-	// Bolder text renders crisper than the thin default font on many Linux
-	// displays; this applies app-wide (settings window, download window, ...).
-	fyneApplication.Settings().SetTheme(newBoldTheme())
-
 	app := &App{
-		fyneApp:    fyneApplication,
-		controller: controller,
-		cfg:        cfg,
+		controller:  controller,
+		cfg:         cfg,
+		engineItems: make(map[string]*systray.MenuItem),
 	}
 
 	app.initHotkey()
-	app.buildSettingsWindow()
 	app.setupTray()
 
-	controller.SetOnStateChange(func(recording bool) {
-		fyne.Do(func() {
-			if app.updateTrayStatus != nil {
-				app.updateTrayStatus(recording)
-			}
-		})
+	controller.SetOnStateChange(app.updateStatus)
+
+	// The notification "取消" button (when the server supports actions) and the
+	// tray status item both route to Cancel; Cancel is a no-op when idle.
+	notify.SetActionHandler(func(action string) {
+		if action == notify.CancelAction {
+			controller.Cancel()
+		}
 	})
 
 	return app
@@ -80,8 +97,8 @@ func (a *App) initHotkey() {
 		a.bindHotkeyLocked(a.cfg.Hotkey)
 	}
 
-	// The xgbutil event loop runs on its own X connection, independent of
-	// fyne's GL loop, so it is safe to run in a separate goroutine.
+	// The xgbutil event loop runs on its own X connection, independent of the
+	// tray's D-Bus loop, so it is safe to run in a separate goroutine.
 	go handler.Listen()
 }
 
@@ -110,10 +127,19 @@ func (a *App) unbindHotkeyLocked() {
 	a.hotkeyBound = false
 }
 
-// SetHotkeyEnabled enables or disables the global hotkey at runtime and
-// persists the change to the config file.
-func (a *App) SetHotkeyEnabled(enabled bool) {
+// HotkeyEnabled reports whether the hotkey is currently enabled in config.
+func (a *App) HotkeyEnabled() bool {
 	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.HotkeyEnabled
+}
+
+// toggleHotkey flips the global hotkey on/off at runtime, binds/unbinds
+// accordingly, persists the change, and updates the tray checkbox. It is wired
+// to the "启用热键监听" menu item.
+func (a *App) toggleHotkey() {
+	a.mu.Lock()
+	enabled := !a.cfg.HotkeyEnabled
 	a.cfg.HotkeyEnabled = enabled
 	if enabled {
 		a.bindHotkeyLocked(a.cfg.Hotkey)
@@ -126,67 +152,291 @@ func (a *App) SetHotkeyEnabled(enabled bool) {
 	if err := config.Save(&cfgCopy); err != nil {
 		log.Printf("Save config failed: %v", err)
 	}
+	if a.hotkeyItem != nil {
+		a.hotkeyItem.SetChecked(enabled)
+	}
 }
 
-// HotkeyEnabled reports whether the hotkey is currently enabled in config.
-func (a *App) HotkeyEnabled() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.cfg.HotkeyEnabled
+// selectEngine switches the active recognition engine from the tray: it persists
+// the new engine, reloads the controller, refreshes the engine menu markers, and
+// then runs an immediate model check, notifying the user to download models when
+// any are missing. The work runs on its own goroutine so a slow engine reload
+// (which may reload local models) does not block the D-Bus menu callback.
+func (a *App) selectEngine(name string) {
+	go func() {
+		a.mu.Lock()
+		same := a.cfg.Engine == name
+		a.cfg.Engine = name
+		cfgCopy := *a.cfg
+		a.mu.Unlock()
+
+		if !same {
+			if err := config.Save(&cfgCopy); err != nil {
+				log.Printf("Save config failed: %v", err)
+				notify.NotifyAux("语音输入", "保存配置失败: "+err.Error(), true)
+				return
+			}
+			if err := a.controller.Reload(&cfgCopy); err != nil {
+				log.Printf("Controller reload failed: %v", err)
+			}
+			a.refreshEngineItems(name)
+		}
+		a.checkModelsNotify(name, cfgCopy.ModelBaseDir())
+	}()
 }
 
-// applySavedConfig is invoked by the settings window after the user saves. It
-// persists the config, reloads the engine, and rebinds the hotkey.
-func (a *App) applySavedConfig(newCfg *config.Config) error {
-	if err := config.Save(newCfg); err != nil {
-		return err
+// refreshEngineItems checks only the currently selected engine's menu item and
+// unchecks the rest, so the engine list behaves as a single-select group with
+// the same checkmark styling as the hotkey toggle.
+func (a *App) refreshEngineItems(selected string) {
+	for name, item := range a.engineItems {
+		item.SetChecked(name == selected)
 	}
-
-	a.mu.Lock()
-	a.cfg = newCfg
-	if newCfg.HotkeyEnabled {
-		a.bindHotkeyLocked(newCfg.Hotkey)
-	} else {
-		a.unbindHotkeyLocked()
-	}
-	a.mu.Unlock()
-
-	if err := a.controller.Reload(newCfg); err != nil {
-		log.Printf("Controller reload failed: %v", err)
-		return err
-	}
-
-	if a.updateTrayStatus != nil {
-		fyne.Do(func() { a.updateTrayStatus(a.controller.IsRecording()) })
-	}
-	log.Println("Settings applied")
-	return nil
 }
 
-// showSettings brings the settings window to the foreground.
-func (a *App) showSettings() {
-	if a.settingsWindow == nil {
+// checkModelsNotify checks the local model set for the given engine and reports
+// the result via a notification. Engines with no local models (whisper) simply
+// confirm the switch.
+func (a *App) checkModelsNotify(engineName, baseDir string) {
+	set := models.ForEngine(engineName)
+	if len(set) == 0 {
+		notify.NotifyAux("语音输入", "已切换到 "+engineName+"（在线引擎，无需本地模型）", true)
 		return
 	}
-	a.settingsWindow.Show()
-	a.settingsWindow.RequestFocus()
+	missing := models.Check(baseDir, set)
+	if len(missing) == 0 {
+		notify.NotifyAux("语音输入", "已切换到 "+engineName+"，模型已就绪", true)
+		return
+	}
+	notify.NotifyAux("语音输入",
+		fmt.Sprintf("已切换到 %s，但缺少 %d 个模型文件，请点托盘“下载模型”获取", engineName, len(missing)),
+		true)
 }
 
-// Run starts the fyne event loop on the calling (main) goroutine and blocks
-// until the app quits.
+// toggleDownload is wired to the "下载模型 / 中断下载" menu item. It doubles as
+// start and stop: when a download is already running it cancels it; otherwise it
+// starts a new one. The single item flips its label between the two states so
+// the user always sees the action a click will perform.
+func (a *App) toggleDownload() {
+	a.downloadMu.Lock()
+	inFlight := a.downloadCancel != nil
+	a.downloadMu.Unlock()
+
+	if inFlight {
+		a.cancelDownload()
+		return
+	}
+	a.startDownload()
+}
+
+// cancelDownload aborts an in-flight download if one is running. The download
+// goroutine observes the cancelled context, reports the interruption, and
+// restores the menu label as it unwinds, so this only needs to trip the cancel
+// function. It is a no-op when nothing is downloading.
+func (a *App) cancelDownload() {
+	a.downloadMu.Lock()
+	cancel := a.downloadCancel
+	a.downloadMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// startDownload downloads any missing model bundles and the sherpa-onnx runtime
+// libraries for the currently selected engine, reporting live progress through
+// the notification aux channel. The transfer is bound to a cancellable context
+// so toggleDownload can interrupt it, and it runs off the D-Bus callback
+// goroutine because it can take minutes. Starting again while a download is
+// already in flight is a no-op.
+func (a *App) startDownload() {
+	a.mu.Lock()
+	engineName := a.cfg.Engine
+	baseDir := a.cfg.ModelBaseDir()
+	a.mu.Unlock()
+
+	set := models.ForEngine(engineName)
+	if len(set) == 0 {
+		notify.NotifyAux("下载模型", "当前引擎无需本地模型（仅 sherpa / sensevoice 需要）", true)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	a.downloadMu.Lock()
+	if a.downloadCancel != nil {
+		// A download is already running; ignore this second start.
+		a.downloadMu.Unlock()
+		cancel()
+		return
+	}
+	a.downloadCancel = cancel
+	a.downloadMu.Unlock()
+
+	a.setDownloadItemLabel("中断下载")
+
+	go func() {
+		defer func() {
+			cancel()
+			a.downloadMu.Lock()
+			a.downloadCancel = nil
+			a.downloadMu.Unlock()
+			a.setDownloadItemLabel("下载模型")
+		}()
+
+		onStatus := func(msg string) { notify.NotifyAux("下载模型", msg, false) }
+		onProgress := func(p models.DownloadProgress) { notify.NotifyAux("下载模型", p.String(), false) }
+
+		if err := models.DownloadMissing(ctx, baseDir, set, onStatus, onProgress); err != nil {
+			a.reportDownloadError(ctx, err)
+			return
+		}
+		// Local engines also need the sherpa-onnx shared libraries next to the
+		// binary (found via its $ORIGIN/lib rpath).
+		libDir := config.RuntimeLibDir()
+		if err := models.DownloadRuntimeLibrary(ctx, libDir, onStatus, onProgress); err != nil {
+			a.reportDownloadError(ctx, err)
+			return
+		}
+		notify.NotifyAux("下载模型", "全部模型与运行库已就绪", true)
+	}()
+}
+
+// reportDownloadError distinguishes a user-triggered interruption (cancelled
+// context) from a genuine transfer failure and notifies accordingly. A
+// cancellation surfaces as a context error either directly or wrapped by the
+// download helpers, so both the returned err and ctx are inspected.
+func (a *App) reportDownloadError(ctx context.Context, err error) {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		notify.NotifyAux("下载模型", "已中断下载", true)
+		return
+	}
+	notify.NotifyAux("下载模型", "下载失败: "+err.Error(), true)
+}
+
+// setDownloadItemLabel updates the download menu item's label, guarding against
+// a nil item (the tray may be unavailable in a headless environment).
+func (a *App) setDownloadItemLabel(label string) {
+	if a.downloadItem != nil {
+		a.downloadItem.SetLabel(label)
+	}
+}
+
+// runEnvCheck runs the shared doctor checks and shows the report as a single
+// multi-line notification. It runs on its own goroutine because some checks make
+// D-Bus/exec calls.
+func (a *App) runEnvCheck() {
+	a.mu.Lock()
+	cfgCopy := *a.cfg
+	a.mu.Unlock()
+
+	go func() {
+		results := doctor.Run(&cfgCopy)
+		var builder strings.Builder
+		for _, r := range results {
+			mark := "✓"
+			if !r.OK {
+				mark = "✗"
+			}
+			builder.WriteString(fmt.Sprintf("[%s] %s: %s\n", mark, r.Name, r.Detail))
+		}
+		notify.NotifyAux("环境检查", strings.TrimRight(builder.String(), "\n"), true)
+	}()
+}
+
+// openConfigDir opens the application directory (holding config.yaml and logs)
+// in the user's file manager via xdg-open.
+func (a *App) openConfigDir() {
+	dir := config.AppDir()
+	if err := exec.Command("xdg-open", dir).Start(); err != nil {
+		log.Printf("open config dir failed: %v", err)
+		notify.NotifyAux("语音输入", "打开配置目录失败: "+err.Error(), true)
+	}
+}
+
+// reloadConfig re-reads the config file from disk, applies it to the controller
+// and hotkey, and refreshes the tray to reflect the new values. It is wired to
+// the "重载配置" menu item so edits made in the config file take effect without
+// restarting the daemon. It runs on its own goroutine since a reload may reload
+// local models.
+func (a *App) reloadConfig() {
+	go func() {
+		newCfg, err := config.Load()
+		if err != nil {
+			log.Printf("Reload config failed: %v", err)
+			notify.NotifyAux("语音输入", "重载配置失败: "+err.Error(), true)
+			return
+		}
+
+		a.mu.Lock()
+		a.cfg = newCfg
+		if newCfg.HotkeyEnabled {
+			a.bindHotkeyLocked(newCfg.Hotkey)
+		} else {
+			a.unbindHotkeyLocked()
+		}
+		engineName := newCfg.Engine
+		hotkeyEnabled := newCfg.HotkeyEnabled
+		a.mu.Unlock()
+
+		if err := a.controller.Reload(newCfg); err != nil {
+			log.Printf("Controller reload failed: %v", err)
+		}
+
+		a.refreshEngineItems(engineName)
+		if a.hotkeyItem != nil {
+			a.hotkeyItem.SetChecked(hotkeyEnabled)
+		}
+		notify.NotifyAux("语音输入", "配置已重载", true)
+	}()
+}
+
+// updateStatus reflects the recording state on the tray: the status item becomes
+// clickable (to cancel) while recording and disabled when idle, and the tooltip
+// tracks the state. It is registered as the controller's state-change callback
+// and may be invoked from a background goroutine.
+func (a *App) updateStatus(recording bool) {
+	if a.statusItem != nil {
+		if recording {
+			a.statusItem.SetLabel("状态: 录音中…（点击取消）")
+			a.statusItem.SetDisabled(false)
+		} else {
+			a.statusItem.SetLabel("状态: 空闲")
+			a.statusItem.SetDisabled(true)
+		}
+	}
+	if a.tray != nil {
+		if recording {
+			a.tray.SetTooltip("Linux Voice Input - 录音中")
+		} else {
+			a.tray.SetTooltip("Linux Voice Input - 空闲")
+		}
+	}
+}
+
+// Run blocks on the systray message loop until Quit is called.
 func (a *App) Run() {
-	a.fyneApp.Run()
+	if a.tray == nil {
+		log.Println("System tray unavailable; nothing to run")
+		return
+	}
+	if err := a.tray.Run(); err != nil {
+		log.Printf("systray run error: %v", err)
+	}
 }
 
-// Quit stops the hotkey listener and terminates the fyne app.
+// Quit stops the hotkey listener and removes the tray, which unblocks Run.
 func (a *App) Quit() {
 	a.mu.Lock()
 	handler := a.hotkeyHandler
+	tray := a.tray
 	a.mu.Unlock()
 
 	if handler != nil {
 		handler.Stop()
 		handler.Close()
 	}
-	fyne.Do(func() { a.fyneApp.Quit() })
+	if tray != nil {
+		tray.Remove()
+	}
 }

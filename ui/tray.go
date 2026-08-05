@@ -1,83 +1,83 @@
 package ui
 
 import (
-	"log"
-
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/driver/desktop"
+	"github.com/gogpu/systray"
 
 	"linux-voice-input/assets"
 )
 
-// setupTray installs the system tray menu. It is a no-op if the running fyne
-// driver does not support a system tray (e.g. a non-desktop environment).
+// setupTray builds the system tray icon and its context menu, storing handles to
+// the items that update at runtime (status, hotkey checkbox, engine markers).
+// The menu layout is:
+//
+//	状态: 空闲                 (disabled when idle; clickable to cancel while recording)
+//	---
+//	启用热键监听               (checkbox)
+//	---
+//	sensevoice|sherpa|whisper   (checkboxes; only the active engine is checked)
+//	---
+//	下载模型 / 环境检查
+//	---
+//	打开配置目录 / 重载配置
+//	---
+//	退出
+//
+// All click callbacks run on gogpu/systray's D-Bus goroutine; handlers that do
+// slow work (engine reload, download, checks) dispatch to their own goroutines.
 func (a *App) setupTray() {
-	deskApp, ok := a.fyneApp.(desktop.App)
-	if !ok {
-		log.Println("System tray not supported by this driver")
-		return
-	}
+	tray := systray.New()
+	menu := systray.NewMenu()
 
-	statusItem := fyne.NewMenuItem("状态: 空闲", nil)
-	statusItem.Disabled = true
+	// Status item: disabled (informational) when idle; while recording it is
+	// enabled and clicking it cancels the recording, which is the GNOME-friendly
+	// fallback for when the notification action button is unavailable.
+	a.statusItem = menu.Add("状态: 空闲", func() {
+		a.controller.Cancel()
+	})
+	a.statusItem.SetDisabled(true)
 
-	hotkeyItem := fyne.NewMenuItem("启用热键监听", nil)
-	hotkeyItem.Checked = a.HotkeyEnabled()
-	hotkeyItem.Action = func() {
-		enabled := !a.HotkeyEnabled()
-		a.SetHotkeyEnabled(enabled)
-		hotkeyItem.Checked = enabled
-		a.refreshTrayMenu(deskApp, statusItem, hotkeyItem)
-	}
+	menu.AddSeparator()
 
-	settingsItem := fyne.NewMenuItem("打开设置…", func() {
-		a.showSettings()
+	a.hotkeyItem = menu.AddCheckbox("启用热键监听", a.HotkeyEnabled(), func() {
+		a.toggleHotkey()
 	})
 
-	quitItem := fyne.NewMenuItem("退出", func() {
-		a.Quit()
-	})
+	menu.AddSeparator()
 
-	menu := fyne.NewMenu("Linux Voice Input",
-		statusItem,
-		fyne.NewMenuItemSeparator(),
-		hotkeyItem,
-		settingsItem,
-		fyne.NewMenuItemSeparator(),
-		quitItem,
-	)
-
-	deskApp.SetSystemTrayIcon(assets.TrayIcon)
-	deskApp.SetSystemTrayMenu(menu)
-
-	a.updateTrayStatus = func(recording bool) {
-		if recording {
-			statusItem.Label = "状态: 录音中…"
-		} else {
-			statusItem.Label = "状态: 空闲"
-		}
-		hotkeyItem.Checked = a.HotkeyEnabled()
-		a.refreshTrayMenu(deskApp, statusItem, hotkeyItem)
+	selectedEngine := a.currentEngine()
+	for _, name := range engineNames {
+		engineName := name
+		item := menu.AddCheckbox(engineName, engineName == selectedEngine, func() {
+			a.selectEngine(engineName)
+		})
+		a.engineItems[engineName] = item
 	}
+
+	menu.AddSeparator()
+
+	a.downloadItem = menu.Add("下载模型", func() { a.toggleDownload() })
+	menu.Add("环境检查", func() { a.runEnvCheck() })
+
+	menu.AddSeparator()
+
+	menu.Add("打开配置目录", func() { a.openConfigDir() })
+	menu.Add("重载配置", func() { a.reloadConfig() })
+
+	menu.AddSeparator()
+
+	menu.Add("退出", func() { a.Quit() })
+
+	tray.SetIcon(assets.TrayIconPNG).
+		SetTooltip("Linux Voice Input - 空闲").
+		SetMenu(menu).
+		Show()
+
+	a.tray = tray
 }
 
-// refreshTrayMenu re-applies the menu so that label/checked changes are
-// reflected in the tray (fyne does not auto-refresh mutated menu items).
-func (a *App) refreshTrayMenu(deskApp desktop.App, statusItem, hotkeyItem *fyne.MenuItem) {
-	settingsItem := fyne.NewMenuItem("打开设置…", func() {
-		a.showSettings()
-	})
-	quitItem := fyne.NewMenuItem("退出", func() {
-		a.Quit()
-	})
-
-	menu := fyne.NewMenu("Linux Voice Input",
-		statusItem,
-		fyne.NewMenuItemSeparator(),
-		hotkeyItem,
-		settingsItem,
-		fyne.NewMenuItemSeparator(),
-		quitItem,
-	)
-	deskApp.SetSystemTrayMenu(menu)
+// currentEngine returns the configured engine name under the lock.
+func (a *App) currentEngine() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.Engine
 }

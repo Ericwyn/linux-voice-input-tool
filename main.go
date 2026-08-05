@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -217,7 +218,7 @@ func runDownloadModels(cfg *config.Config) {
 		inProgress = true
 	}
 
-	err := models.DownloadMissing(baseDir, set, status, progress)
+	err := models.DownloadMissing(context.Background(), baseDir, set, status, progress)
 	if inProgress {
 		fmt.Println()
 	}
@@ -236,7 +237,7 @@ func runDownloadModels(cfg *config.Config) {
 	libDir := config.RuntimeLibDir()
 	fmt.Printf("运行库目录: %s\n", libDir)
 	inProgress = false
-	if err := models.DownloadRuntimeLibrary(libDir, status, progress); err != nil {
+	if err := models.DownloadRuntimeLibrary(context.Background(), libDir, status, progress); err != nil {
 		if inProgress {
 			fmt.Println()
 		}
@@ -315,7 +316,7 @@ func printUsage() {
 
 选项:
   --record           触发录音开关：有守护进程则转发给它，否则独立运行一次
-  --daemon           以常驻守护进程运行（系统托盘 + 全局热键 + 设置窗口）
+  --daemon           以常驻守护进程运行（系统托盘 + 全局热键；配置通过编辑配置文件后在托盘“重载配置”生效）
   --test             测试模式：录音 3 秒并识别，用于验证配置是否正确
   --download-models  下载当前引擎所需的模型与运行库（sherpa / sensevoice 引擎需要）
   --check-config     检查配置与环境依赖，并打印报告
@@ -386,7 +387,7 @@ func runStandalone(cfg *config.Config) {
 
 // runDaemon starts the resident background process: it preloads models, listens
 // on the socket for forwarded toggles, registers the global hotkey, and runs
-// the fyne app with a system tray and settings window.
+// the systray-based app whose tray menu drives all interaction.
 func runDaemon(cfg *config.Config) {
 	sock := socketPath()
 
