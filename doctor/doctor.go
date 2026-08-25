@@ -32,8 +32,39 @@ func Run(cfg *config.Config) []Result {
 	results = append(results, checkCommands()...)
 	results = append(results, checkConfigFile())
 	results = append(results, checkEngine(cfg)...)
+	results = append(results, checkCorrections(cfg)...)
 
 	return results
+}
+
+// checkCorrections validates only opt-in model data. The application already
+// links ONNX Runtime through sherpa-onnx, and the correction runner can locate
+// that loaded library in plain development builds as well as packaged ones.
+func checkCorrections(cfg *config.Config) []Result {
+	if cfg == nil || !cfg.Corrections.Enabled {
+		return nil
+	}
+	if cfg.Corrections.Strategy == "" {
+		return []Result{{Name: "中文纠错", OK: true,
+			Detail: fmt.Sprintf("已启用（仅用户词典：%s）", cfg.CorrectionsDictPath())}}
+	}
+	paths, err := cfg.CorrectionModelPaths(cfg.Corrections.Strategy)
+	if err != nil {
+		return []Result{{Name: "中文纠错模型", OK: false, Detail: err.Error()}}
+	}
+	var missing []string
+	for _, path := range []string{paths.Model, paths.Vocab} {
+		if info, statErr := os.Stat(path); statErr != nil || info.IsDir() || info.Size() == 0 {
+			missing = append(missing, path)
+		}
+	}
+	if len(missing) > 0 {
+		return []Result{{Name: "中文纠错模型", OK: false,
+			Detail: fmt.Sprintf("策略 %s 缺失 %d 个文件；运行 --download-models 或点托盘“下载模型”：\n    - %s",
+				cfg.Corrections.Strategy, len(missing), strings.Join(missing, "\n    - "))}}
+	}
+	return []Result{{Name: "中文纠错模型", OK: true,
+		Detail: fmt.Sprintf("%s 已就绪（%s）", cfg.Corrections.Strategy, filepath.Dir(paths.Model))}}
 }
 
 // AllOK reports whether every result passed.
@@ -141,7 +172,7 @@ func checkEngine(cfg *config.Config) []Result {
 			Detail: fmt.Sprintf("全部就绪（%s）", baseDir)})
 		return results
 	}
-	detail := fmt.Sprintf("缺失 %d 个文件（运行 --download-models 或在设置中下载）:", len(missing))
+	detail := fmt.Sprintf("缺失 %d 个文件（运行 --download-models 或点托盘“下载模型”）:", len(missing))
 	for _, item := range missing {
 		detail += fmt.Sprintf("\n    - %s: %s", item.Model, item.Path)
 	}

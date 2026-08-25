@@ -32,6 +32,8 @@ var engineNames = []string{"sensevoice", "sherpa", "whisper"}
 // session controller.
 type App struct {
 	controller *session.Controller
+	// saveConfig is injectable for focused tray behavior tests.
+	saveConfig func(*config.Config) error
 
 	mu            sync.Mutex
 	cfg           *config.Config
@@ -40,11 +42,12 @@ type App struct {
 
 	// tray and the menu-item handles are created in setupTray and updated live
 	// from menu callbacks and the recording state-change callback.
-	tray         *systray.SystemTray
-	statusItem   *systray.MenuItem
-	hotkeyItem   *systray.MenuItem
-	engineItems  map[string]*systray.MenuItem
-	downloadItem *systray.MenuItem
+	tray            *systray.SystemTray
+	statusItem      *systray.MenuItem
+	hotkeyItem      *systray.MenuItem
+	correctionsItem *systray.MenuItem
+	engineItems     map[string]*systray.MenuItem
+	downloadItem    *systray.MenuItem
 
 	// downloadMu guards downloadCancel, which is non-nil exactly while a model
 	// download is in flight. Cancelling it aborts the transfer; the download
@@ -62,6 +65,7 @@ func NewApp(cfg *config.Config, controller *session.Controller) *App {
 	app := &App{
 		controller:  controller,
 		cfg:         cfg,
+		saveConfig:  config.Save,
 		engineItems: make(map[string]*systray.MenuItem),
 	}
 
@@ -157,6 +161,65 @@ func (a *App) toggleHotkey() {
 	}
 }
 
+// CorrectionsEnabled reports whether final-text correction is enabled in the
+// live UI configuration.
+func (a *App) CorrectionsEnabled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.Corrections.Enabled
+}
+
+// toggleCorrections flips the post-recognition correction service, persists
+// the setting, and updates the tray checkbox. Unlike an engine switch it never
+// reloads SenseVoice; the selected correction model initializes lazily on the
+// next final transcription.
+func (a *App) toggleCorrections() {
+	a.mu.Lock()
+	enabled := !a.cfg.Corrections.Enabled
+	a.cfg.Corrections.Enabled = enabled
+	cfgCopy := *a.cfg
+	saveConfig := a.saveConfig
+	a.mu.Unlock()
+
+	a.controller.SetCorrectionsEnabled(enabled)
+	if saveConfig == nil {
+		saveConfig = config.Save
+	}
+	if err := saveConfig(&cfgCopy); err != nil {
+		log.Printf("Save correction toggle failed: %v", err)
+	}
+	if a.correctionsItem != nil {
+		a.correctionsItem.SetChecked(enabled)
+	}
+	if a.tray != nil {
+		a.notifyCorrectionToggle(enabled, &cfgCopy)
+	}
+	log.Printf("Text corrections enabled=%v", enabled)
+}
+
+func (a *App) notifyCorrectionToggle(enabled bool, cfg *config.Config) {
+	if !enabled {
+		notify.NotifyAux("语音纠错", "已关闭", true)
+		return
+	}
+	if cfg.Corrections.Strategy == "" {
+		notify.NotifyAux("语音纠错", "已启用（仅用户词典）", true)
+		return
+	}
+	set := models.ForCorrectionStrategy(cfg.Corrections.Strategy)
+	if len(set) == 0 {
+		notify.NotifyAux("语音纠错", "配置的模型策略无效，请检查配置文件", true)
+		return
+	}
+	missing := models.Check(cfg.CorrectionsModelDir(), set)
+	if len(missing) > 0 {
+		notify.NotifyAux("语音纠错",
+			fmt.Sprintf("已启用，但缺少 %d 个模型文件；请点托盘“下载模型”自动获取", len(missing)), true)
+		return
+	}
+	notify.NotifyAux("语音纠错", "已启用，模型已就绪", true)
+}
+
 // selectEngine switches the active recognition engine from the tray: it persists
 // the new engine, reloads the controller, refreshes the engine menu markers, and
 // then runs an immediate model check, notifying the user to download models when
@@ -243,21 +306,28 @@ func (a *App) cancelDownload() {
 	}
 }
 
-// startDownload downloads any missing model bundles and the sherpa-onnx runtime
-// libraries for the currently selected engine, reporting live progress through
-// the notification aux channel. The transfer is bound to a cancellable context
-// so toggleDownload can interrupt it, and it runs off the D-Bus callback
-// goroutine because it can take minutes. Starting again while a download is
-// already in flight is a no-op.
+// startDownload downloads every model required by the live config: recognition
+// models plus the selected correction model when enabled, followed by the
+// shared ONNX Runtime libraries. It runs off the D-Bus callback goroutine and
+// remains cancellable through the same menu item.
 func (a *App) startDownload() {
 	a.mu.Lock()
-	engineName := a.cfg.Engine
-	baseDir := a.cfg.ModelBaseDir()
+	request := models.DownloadRequest{
+		EngineName:         a.cfg.Engine,
+		EngineBaseDir:      a.cfg.ModelBaseDir(),
+		CorrectionsEnabled: a.cfg.Corrections.Enabled,
+		CorrectionStrategy: a.cfg.Corrections.Strategy,
+		CorrectionBaseDir:  a.cfg.CorrectionsModelDir(),
+	}
 	a.mu.Unlock()
 
-	set := models.ForEngine(engineName)
-	if len(set) == 0 {
-		notify.NotifyAux("下载模型", "当前引擎无需本地模型（仅 sherpa / sensevoice 需要）", true)
+	groups, err := models.RequiredDownloads(request)
+	if err != nil {
+		notify.NotifyAux("下载模型", "模型配置错误: "+err.Error(), true)
+		return
+	}
+	if len(groups) == 0 {
+		notify.NotifyAux("下载模型", "当前配置无需本地模型", true)
 		return
 	}
 
@@ -287,9 +357,12 @@ func (a *App) startDownload() {
 		onStatus := func(msg string) { notify.NotifyAux("下载模型", msg, false) }
 		onProgress := func(p models.DownloadProgress) { notify.NotifyAux("下载模型", p.String(), false) }
 
-		if err := models.DownloadMissing(ctx, baseDir, set, onStatus, onProgress); err != nil {
-			a.reportDownloadError(ctx, err)
-			return
+		for _, group := range groups {
+			onStatus(fmt.Sprintf("%s目录: %s", group.Label, group.BaseDir))
+			if err := models.DownloadMissing(ctx, group.BaseDir, group.Models, onStatus, onProgress); err != nil {
+				a.reportDownloadError(ctx, err)
+				return
+			}
 		}
 		// Local engines also need the sherpa-onnx shared libraries next to the
 		// binary (found via its $ORIGIN/lib rpath).
@@ -377,6 +450,7 @@ func (a *App) reloadConfig() {
 		}
 		engineName := newCfg.Engine
 		hotkeyEnabled := newCfg.HotkeyEnabled
+		correctionsEnabled := newCfg.Corrections.Enabled
 		a.mu.Unlock()
 
 		if err := a.controller.Reload(newCfg); err != nil {
@@ -386,6 +460,9 @@ func (a *App) reloadConfig() {
 		a.refreshEngineItems(engineName)
 		if a.hotkeyItem != nil {
 			a.hotkeyItem.SetChecked(hotkeyEnabled)
+		}
+		if a.correctionsItem != nil {
+			a.correctionsItem.SetChecked(correctionsEnabled)
 		}
 		notify.NotifyAux("语音输入", "配置已重载", true)
 	}()

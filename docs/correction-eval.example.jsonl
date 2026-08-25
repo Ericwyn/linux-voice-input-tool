@@ -1,0 +1,15 @@
+{"input":"少先队员因该为老人让坐","expected":"少先队员应该为老人让座","category":"homophone"}
+{"input":"我门需要提高工作效率","expected":"我们需要提高工作效率","category":"homophone"}
+{"input":"这项功能已经部属完成","expected":"这项功能已经部署完成","category":"homophone"}
+{"input":"请把结果保存在本地缓成中","expected":"请把结果保存在本地缓存中","category":"domain"}
+{"input":"他以经完成了今天的任务","expected":"他已经完成了今天的任务","category":"homophone"}
+{"input":"这个问提需要进一步讨论","expected":"这个问题需要进一步讨论","category":"homophone"}
+{"input":"请检察一下配置文件","expected":"请检查一下配置文件","category":"homophone"}
+{"input":"我们在开一个新的现成处理任务","expected":"我们再开一个新的线程处理任务","category":"asr"}
+{"input":"今天的天气很好，适合出去散步。","expected":"今天的天气很好，适合出去散步。","category":"clean"}
+{"input":"请打开设置页面，然后重新加载配置。","expected":"请打开设置页面，然后重新加载配置。","category":"clean"}
+{"input":"SenseVoice 已经完成本地识别。","expected":"SenseVoice 已经完成本地识别。","category":"clean"}
+{"input":"这是现成的解决方案，不需要重新开发。","expected":"这是现成的解决方案，不需要重新开发。","category":"clean-ambiguous"}
+{"input":"请换成另外一种实现方式。","expected":"请换成另外一种实现方式。","category":"clean-ambiguous"}
+{"input":"多线程程序需要注意锁竞争。","expected":"多线程程序需要注意锁竞争。","category":"clean-domain"}
+{"input":"Redis 服务已经启动，缓存连接正常。","expected":"Redis 服务已经启动，缓存连接正常。","category":"clean-domain"}

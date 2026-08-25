@@ -4,7 +4,7 @@
 
 - **不与输入法冲突**：识别结果通过「写入剪贴板 + 模拟 `Ctrl+V`」上屏，既不注入也不注册为输入法框架，因此与 ibus / fcitx 等中文输入法完全兼容、互不干扰，可与现有输入习惯并存。
 - **本地优先**：默认使用本地 SenseVoice 模型，完全离线，识别 + 标点一步到位。
-- **两种触发方式**：Ubuntu 自定义快捷键（`--record`）或常驻守护进程（`--daemon`，自带全局热键 + 系统托盘 + 图形设置）。
+- **两种触发方式**：Ubuntu 自定义快捷键（`--record`）或常驻守护进程（`--daemon`，自带全局热键 + 系统托盘）。
 - **三种识别引擎**：本地 SenseVoice（默认）、本地 sherpa 三模型 pipeline、在线 whisper API，可按需切换。
 
 
@@ -32,10 +32,11 @@
 - 🎙️ **一键录音识别**：按一次开始、再按一次结束，结果直接粘贴到当前输入框。
 - 🧠 **本地离线识别**：默认 SenseVoice 单模型，识别 + 标点一体，无需联网、不上传音频。
 - ⚡ **实时预览**：录音过程中通过桌面通知实时显示识别文字。
-- 🖥️ **系统托盘 + 图形设置**：守护进程模式下常驻后台，模型只加载一次，触发更快。
+- 🖥️ **系统托盘控制**：守护进程模式下常驻后台，模型只加载一次，常用开关即时生效。
 - 🔌 **可切换引擎**：本地 SenseVoice / 本地 sherpa / 在线 whisper，按需选择。
 - 📦 **一键下载模型**：内置 `--download-models`，带下载进度和速度显示。
 - 🩺 **配置自检**：`--check-config` 一键检查环境依赖与模型是否就绪。
+- ✍️ **本地中文纠错**：可选 INT8 MacBERT/MDCSpell 模型 + 用户词典，最终粘贴前离线纠错，托盘即时开关。
 
 ---
 
@@ -55,6 +56,8 @@
 录音中：定时重跑 SenseVoice → 通知显示实时预览
     ↓ 停止录音
 对完整音频跑一次 SenseVoice（识别 + 标点）
+    ↓
+可选中文纠错（BERT MLM → 用户词典）
     ↓
 剪贴板 + Ctrl+V 粘贴
 ```
@@ -203,15 +206,15 @@ mkdir -p lib && cp sherpa-onnx-v1.13.4-linux-x64-shared-lib/lib/*.so lib/
 
 ### 3. 下载模型
 
-本地引擎（sensevoice / sherpa）需要模型文件。程序内置下载命令，会把当前引擎所需的模型下载并解压到 `~/.linux-voice-input/models/`，并显示进度与速度：
+程序内置下载命令，会下载当前配置需要的识别模型；如果已经启用神经纠错，还会自动下载当前 `corrections.strategy` 选择的纠错模型，并显示进度与速度：
 
 ```bash
 ./linux-voice-input --download-models
 ```
 
-默认引擎为 sensevoice，只需下载一个模型（约 155 MB，为去掉冗余文件后重新打包的精简 int8 模型）。若切换到 sherpa 引擎，再次运行该命令会下载 sherpa 所需的三个模型。
+默认引擎为 sensevoice，只需下载一个识别模型（约 155 MB，为去掉冗余文件后重新打包的精简 int8 模型）。若切换到 sherpa 引擎，再次运行该命令会下载 sherpa 所需的三个模型。启用纠错后，会额外下载当前选择的约 100 MB 压缩模型包到 `~/.linux-voice-input/models/correction/`。
 
-> whisper 引擎无需本地模型，运行该命令会提示「无需下载」。
+> whisper 引擎本身无需本地识别模型；但如果启用了神经纠错，仍会下载所选的本地纠错模型。
 
 #### 通过代理下载
 
@@ -256,9 +259,9 @@ linux-voice-input [选项]
 
 选项:
   --record           触发录音开关：有守护进程则转发给它，否则独立运行一次
-  --daemon           以常驻守护进程运行（系统托盘 + 全局热键 + 设置窗口）
+  --daemon           以常驻守护进程运行（系统托盘 + 全局热键；编辑配置后可从托盘重载）
   --test             测试模式：录音 3 秒并识别，用于验证配置是否正确
-  --download-models  下载当前引擎所需的模型与运行库（sherpa / sensevoice 引擎需要）
+  --download-models  下载当前配置所需的识别模型、纠错模型与运行库
   --check-config     检查配置与环境依赖，并打印报告
   -v, --version      显示版本号
   -h, --help         显示本帮助信息（无参数时默认显示）
@@ -310,11 +313,13 @@ linux-voice-input [选项]
 - 系统托盘菜单：
   - **状态显示**（空闲 / 录音中…）
   - **启用热键监听**（勾选切换，立即生效并保存）
-  - **打开设置…**（图形化配置引擎、模型目录、API Key、热键、通知开关等，保存即热重载）
+  - **启用语音纠错**（勾选切换，立即生效并保存，不重载 ASR）
+  - **sensevoice / sherpa / whisper**（选择识别引擎）
+  - **下载模型 / 环境检查**
+  - **打开配置目录 / 重载配置**
   - **退出**
-- 关闭设置窗口只是隐藏，进程继续在后台运行。
 
-设置窗口内可以：切换识别引擎；填写 / 浏览模型目录并点「检查模型」「下载缺失模型」（带进度）；调整各引擎的专属参数（如 sensevoice 的实时预览间隔、sherpa 的断句阈值、whisper 的 API Key）；配置全局热键、采样率、剪贴板恢复与各类通知开关；以及运行「环境检查」。
+更细的模型目录、API Key、热键、通知和纠错参数通过 `~/.linux-voice-input/config.yaml` 配置；保存后点托盘“重载配置”生效。
 
 > **GNOME 托盘图标不显示？** GNOME 默认不显示系统托盘，安装并启用 AppIndicator 扩展：
 >
@@ -371,6 +376,17 @@ sensevoice:
 
 audio:
   sample_rate: 16000
+corrections:
+  enabled: false                    # 可在托盘“启用语音纠错”即时切换
+  strategy: macbert-mdcspell-v2     # macbert-mdcspell-v2 / macbert4csc；留空为纯词典
+  model_dir: /home/<user>/.linux-voice-input/models/correction
+  runtime_path: ""                  # 通常留空，复用应用自带 libonnxruntime
+  confidence_threshold: 0.9         # 高阈值优先避免误改
+  min_margin: 0.2
+  max_length: 128
+  timeout_ms: 1500
+  num_threads: 4
+  dict_path: ""                     # 留空则用 ~/.linux-voice-input/corrections.txt
 hotkey: alt+shift+g
 hotkey_enabled: true
 restore_clipboard: true
@@ -419,9 +435,126 @@ whisper:
 | `audio.sample_rate` | 录音采样率，默认 16000 |
 | `hotkey` | 守护进程全局热键，如 `alt+shift+g`（修饰键：ctrl/alt/shift/super） |
 | `hotkey_enabled` | 守护进程启动时是否启用全局热键监听 |
+| `corrections.enabled` | 是否开启最终文本纠错（神经模型 + 用户词典），默认 `false`；托盘可即时切换 |
+| `corrections.strategy` | 神经模型：`macbert-mdcspell-v2`（默认）/ `macbert4csc`；空值表示纯词典 |
+| `corrections.model_dir` | 纠错模型根目录，默认 `~/.linux-voice-input/models/correction` |
+| `corrections.runtime_path` | ONNX Runtime 动态库；通常留空，自动复用应用自带运行库 |
+| `corrections.confidence_threshold` | 候选字最低概率，默认 `0.9` |
+| `corrections.min_margin` | 候选字相对原字概率的最低增量，默认 `0.2` |
+| `corrections.max_length` | 单次模型最多处理的 BERT token 数，默认 128；超出部分保持原文 |
+| `corrections.timeout_ms` | 单次最终纠错软超时，默认 1500ms |
+| `corrections.num_threads` | 纠错模型 CPU 推理线程数，默认 4 |
+| `corrections.dict_path` | 最后执行的用户词典路径；留空则用 `~/.linux-voice-input/corrections.txt` |
 | `restore_clipboard` | 粘贴后是否恢复原剪贴板内容 |
 
 > **旧配置自动迁移**：如果你的 `config.yaml` 还是旧的 `api:` 块格式（`api.engine` / `api.key` 等），程序会在加载时自动迁移到新的 `engine` + `whisper` 布局并回写，无需手动改动。
+
+### 本地中文纠错（模型 + 用户词典）
+
+纠错发生在识别引擎完成最终识别之后、粘贴之前，对 sensevoice / sherpa / whisper 都生效：
+
+```text
+最终识别文本
+  -> 一个 BERT MLM 模型（高置信度、只改单个汉字）
+  -> 用户精确词典（最终决定权，可做不等长/英文替换）
+  -> 粘贴
+```
+
+当前支持两个约 0.1B 参数的模型策略：
+
+| 策略 | 来源 | 本项目 INT8 文件 | 特点 |
+| --- | --- | ---: | --- |
+| `macbert-mdcspell-v2`（默认） | [Macropodus/macbert4mdcspell_v2](https://huggingface.co/Macropodus/macbert4mdcspell_v2) | 约 114.4 MiB | 本地小样本召回更好、正确句无误改 |
+| `macbert4csc` | [shibing624/macbert4csc-base-chinese](https://huggingface.co/shibing624/macbert4csc-base-chinese) | 约 114.4 MiB | 成熟基准模型 |
+
+产品运行只依赖 Go 编译产物和已有 `libonnxruntime`。推荐直接使用内置下载器：先启用纠错并选择策略，再下载当前配置缺少的模型。
+
+```bash
+# 配置文件中设置 corrections.enabled: true 和所需 strategy 后：
+./linux-voice-input --download-models
+
+# 或在守护进程托盘中：
+# 1. 勾选“启用语音纠错”
+# 2. 点击“下载模型”
+
+./linux-voice-input --check-config
+```
+
+切换模型只需修改配置，然后重载并再次执行下载；下载器只补当前策略缺失的文件：
+
+```yaml
+corrections:
+  enabled: true
+  strategy: macbert4csc  # 或 macbert-mdcspell-v2
+```
+
+Python/PyTorch 不再是安装模型的必需依赖。开发者如需从上游 checkpoint 重新导出、量化或复现实验，才运行：
+
+```bash
+python3 -m pip install -r scripts/correction/requirements.txt
+
+# 默认准备两个模型到 ~/.linux-voice-input/models/correction
+python3 scripts/correction/prepare_models.py
+
+# 也可只准备默认模型
+python3 scripts/correction/prepare_models.py --models macbert-mdcspell-v2
+```
+
+准备好模型后，守护进程托盘勾选 **“启用语音纠错”** 即时生效，不会重载 SenseVoice。也可以编辑 `corrections.enabled` 后点击托盘“重载配置”。模型首次使用会懒加载，之后保持常驻；模型缺失或推理失败时原文透传，用户词典仍会继续执行。
+
+#### 本地模型评测
+
+评测命令支持一句话、标准输入多行和 JSONL case 文件：
+
+```bash
+# 一句话，同时比较两个模型
+go run ./cmd/correction-eval --text '我门已经部属完成'
+
+# 多句话
+printf '%s\n' '我门需要提高工作效率' '今天的天气很好' \
+  | go run ./cmd/correction-eval
+
+# 带 expected 的可重复评测
+go run ./cmd/correction-eval --cases docs/correction-eval.example.jsonl
+```
+
+当前机器用默认阈值 `0.90`、margin `0.20` 对 15 条错句/正确句/歧义句的实测结果：
+
+| 模型 | 完全匹配 | 正确/歧义句误改 | 首次加载 | 加载后单句 |
+| --- | ---: | ---: | ---: | ---: |
+| MDCSpell-v2 INT8 | 12/15 | 0 | 约 459ms | 约 6–13ms |
+| MacBERT4CSC INT8 | 11/15 | 0 | 约 433ms | 约 6–12ms |
+
+这只是工程通路和小样本安全性验证，不替代真实 SenseVoice 错误语料评测。建议把日常遇到的“原始识别/期望文本”持续追加到自己的 JSONL，再决定阈值或模型。
+
+#### 用户词典（纠正专业名词）
+
+本地模型对一些计算机专业名词容易识别错，典型的两类错误是**中文同音词**（把「线程」听成「现成」）和**英文术语被音译成中文**（把 `Redis` 听成「瑞迪斯」）。你可以维护一份纠正词典，程序会在识别完成、粘贴之前对结果做文本替换。它对所有引擎（sensevoice / sherpa / whisper）都生效。
+
+启用步骤：
+
+1. 在托盘勾选“启用语音纠错”，或把 `corrections.enabled` 改成 `true`。
+2. 准备词典文件（默认 `~/.linux-voice-input/corrections.txt`），可直接拷仓库里的示例 [`docs/corrections.example.txt`](./docs/corrections.example.txt)：
+   ```bash
+   cp docs/corrections.example.txt ~/.linux-voice-input/corrections.txt
+   ```
+3. 保存即生效，**无需重启**——程序检测到词典文件修改时间变化会自动重载。
+
+词典格式，每行一条规则：
+
+```text
+# '=' 左边是正确词，右边是可能被识别成的错词，多个错词用逗号分隔（中英文逗号均可）
+# 以 # 开头的行是注释，空行忽略
+
+Redis = 瑞迪斯, 瑞迪思
+Docker = 道克, 道客
+多线程 = 多现成, 多先成
+缓存 = 换成
+```
+
+匹配规则：从左到右扫描，优先匹配最长的错词；已经替换出的正确词不会被后续规则再次替换（不会连锁触发）。
+
+> ⚠️ **注意误伤**：替换是纯文本匹配，如果某个「错词」在日常语境里也是正常词（如「现成」），就可能改错。建议优先维护英文术语音译这类几乎不会歧义的规则；对有歧义的同音词，尽量用更长的上下文（如用「多现成」而不是「现成」），并小范围试用后再固定下来。
 
 ---
 

@@ -15,6 +15,7 @@ import (
 
 	"linux-voice-input/audio"
 	"linux-voice-input/config"
+	"linux-voice-input/corrector"
 	"linux-voice-input/doctor"
 	"linux-voice-input/engine"
 	"linux-voice-input/models"
@@ -186,19 +187,26 @@ func main() {
 	}
 }
 
-// runDownloadModels downloads any missing sherpa model bundles into the
-// configured model directory, printing progress to stdout. Shares the same
-// entry point (models.DownloadMissing) as the settings window button. Only the
-// sherpa engine uses local models; other engines have nothing to download.
+// runDownloadModels downloads every local model required by the live config:
+// the selected recognition engine plus the selected correction strategy when
+// corrections are enabled. Recognition and correction models have different
+// base directories, so they are processed as separate download groups.
 func runDownloadModels(cfg *config.Config) {
-	set := models.ForEngine(cfg.Engine)
-	if len(set) == 0 {
-		fmt.Printf("当前引擎为 %q，无需下载本地模型（仅 sherpa / sensevoice 引擎使用本地模型）。\n", cfg.Engine)
+	groups, err := models.RequiredDownloads(models.DownloadRequest{
+		EngineName:         cfg.Engine,
+		EngineBaseDir:      cfg.ModelBaseDir(),
+		CorrectionsEnabled: cfg.Corrections.Enabled,
+		CorrectionStrategy: cfg.Corrections.Strategy,
+		CorrectionBaseDir:  cfg.CorrectionsModelDir(),
+	})
+	if err != nil {
+		fmt.Printf("模型配置错误: %v\n", err)
+		os.Exit(1)
+	}
+	if len(groups) == 0 {
+		fmt.Printf("当前引擎为 %q，且未启用神经纠错，无需下载本地模型。\n", cfg.Engine)
 		return
 	}
-
-	baseDir := cfg.ModelBaseDir()
-	fmt.Printf("模型目录: %s\n", baseDir)
 
 	// Milestone messages print on their own line; byte-level progress refreshes
 	// in place with a carriage return. inProgress tracks whether the cursor is
@@ -218,13 +226,20 @@ func runDownloadModels(cfg *config.Config) {
 		inProgress = true
 	}
 
-	err := models.DownloadMissing(context.Background(), baseDir, set, status, progress)
-	if inProgress {
-		fmt.Println()
-	}
-	if err != nil {
-		fmt.Printf("下载失败: %v\n", err)
-		os.Exit(1)
+	for _, group := range groups {
+		fmt.Printf("%s目录: %s\n", group.Label, group.BaseDir)
+		if err := models.DownloadMissing(context.Background(), group.BaseDir, group.Models, status, progress); err != nil {
+			if inProgress {
+				fmt.Println()
+				inProgress = false
+			}
+			fmt.Printf("下载失败: %v\n", err)
+			os.Exit(1)
+		}
+		if inProgress {
+			fmt.Println()
+			inProgress = false
+		}
 	}
 
 	// Local engines also link the sherpa-onnx native shared libraries. Populate
@@ -318,7 +333,7 @@ func printUsage() {
   --record           触发录音开关：有守护进程则转发给它，否则独立运行一次
   --daemon           以常驻守护进程运行（系统托盘 + 全局热键；配置通过编辑配置文件后在托盘“重载配置”生效）
   --test             测试模式：录音 3 秒并识别，用于验证配置是否正确
-  --download-models  下载当前引擎所需的模型与运行库（sherpa / sensevoice 引擎需要）
+  --download-models  下载当前配置所需的识别模型、纠错模型与运行库
   --check-config     检查配置与环境依赖，并打印报告
   -v, --version      显示版本号
   -h, --help         显示本帮助信息（无参数时默认显示）
@@ -502,9 +517,42 @@ func runTestMode(cfg *config.Config) {
 		log.Fatalf("Transcription failed: %v", err)
 	}
 
+	text = applyConfiguredCorrections(cfg, text)
 	if text == "" {
 		fmt.Println("[TEST] 识别结果: (空，未识别到内容)")
 	} else {
 		fmt.Printf("[TEST] 识别结果 (总耗时 %dms): %s\n", time.Since(startTime).Milliseconds(), text)
 	}
+}
+
+// applyConfiguredCorrections gives --test the same final-text behavior as the
+// daemon/controller path while keeping the audio test setup independent of the
+// session package. Every failure is fail-open and leaves the recognition text
+// available for diagnostics.
+func applyConfiguredCorrections(cfg *config.Config, text string) string {
+	if text == "" || cfg == nil || !cfg.Corrections.Enabled {
+		return text
+	}
+	service, err := corrector.NewServiceFromConfig(cfg)
+	if err != nil {
+		log.Printf("Test-mode correction setup failed: %v", err)
+		return text
+	}
+	defer service.Close()
+
+	ctx := context.Background()
+	cancel := func() {}
+	if cfg.Corrections.TimeoutMs > 0 {
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(cfg.Corrections.TimeoutMs)*time.Millisecond)
+	}
+	result := service.Correct(ctx, text)
+	cancel()
+	for _, failure := range result.Failures {
+		log.Printf("Test-mode correction strategy %s failed: %v", failure.Strategy, failure.Err)
+	}
+	if result.Text != text {
+		fmt.Printf("[TEST] 纠错结果 (%dms, %s): %s\n",
+			result.Duration.Milliseconds(), strings.Join(result.Applied, ","), result.Text)
+	}
+	return result.Text
 }

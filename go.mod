@@ -7,6 +7,7 @@ require (
 	github.com/BurntSushi/xgbutil v0.0.0-20190907113008-ad855c713046
 	github.com/gogpu/systray v0.2.1
 	github.com/gordonklaus/portaudio v0.0.0-20260203164431-765aa7dfa631
+	github.com/yalue/onnxruntime_go v1.31.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"gopkg.in/yaml.v3"
 
@@ -70,6 +72,46 @@ type SenseVoiceConfig struct {
 	PreviewIntervalMs int `yaml:"preview_interval_ms"`
 }
 
+// CorrectionsConfig configures the engine-agnostic final-text correction
+// service: one optional neural BERT strategy followed by a user dictionary.
+type CorrectionsConfig struct {
+	// Enabled turns the whole service on. When false neither model nor
+	// dictionary is called and the recognized text is pasted unchanged.
+	Enabled bool `yaml:"enabled"`
+	// Strategy selects the optional neural correction model. Supported values
+	// are macbert-mdcspell-v2 and macbert4csc. An explicit empty value keeps the
+	// service in dictionary-only mode.
+	Strategy string `yaml:"strategy"`
+	// ModelDir contains one subdirectory per strategy. When empty it defaults to
+	// <DefaultModelDir>/correction.
+	ModelDir string `yaml:"model_dir"`
+	// RuntimePath points at libonnxruntime. When empty it is resolved next to the
+	// executable, sharing the runtime already bundled for sherpa-onnx.
+	RuntimePath string `yaml:"runtime_path"`
+	// ConfidenceThreshold and MinMargin limit model-driven rewrites. Both must
+	// pass so the service favors precision and low over-correction.
+	ConfidenceThreshold float64 `yaml:"confidence_threshold"`
+	MinMargin           float64 `yaml:"min_margin"`
+	MaxLength           int     `yaml:"max_length"`
+	TimeoutMs           int     `yaml:"timeout_ms"`
+	NumThreads          int     `yaml:"num_threads"`
+	// DictPath is the correction dictionary file. It is hot-reloaded on change,
+	// so edits take effect without restarting the daemon. When empty it
+	// defaults to <AppDir>/corrections.txt.
+	DictPath string `yaml:"dict_path"`
+}
+
+const (
+	CorrectionStrategyMDCSpell = models.CorrectionStrategyMDCSpell
+	CorrectionStrategyMacBERT  = models.CorrectionStrategyMacBERT
+)
+
+// CorrectionModelFiles are the two files required by a BERT MLM strategy.
+type CorrectionModelFiles struct {
+	Model string
+	Vocab string
+}
+
 type AudioConfig struct {
 	SampleRate int `yaml:"sample_rate"`
 }
@@ -98,6 +140,7 @@ type Config struct {
 
 	Audio            AudioConfig         `yaml:"audio"`
 	Notifications    NotificationsConfig `yaml:"notifications"`
+	Corrections      CorrectionsConfig   `yaml:"corrections"`
 	RestoreClipboard bool                `yaml:"restore_clipboard"`
 	// Hotkey is the global hotkey combination that toggles recording,
 	// e.g. "alt+shift+g". Modifiers: ctrl/alt/shift/super.
@@ -154,6 +197,21 @@ func DefaultConfig() *Config {
 		Audio: AudioConfig{
 			SampleRate: 16000,
 		},
+		Corrections: CorrectionsConfig{
+			// Off by default so existing users see no behavior change; turning
+			// it on is a deliberate opt-in. DictPath empty means the default
+			// <AppDir>/corrections.txt (resolved by CorrectionsDictPath).
+			Enabled:             false,
+			Strategy:            CorrectionStrategyMDCSpell,
+			ModelDir:            DefaultCorrectionsModelDir(),
+			RuntimePath:         "",
+			ConfidenceThreshold: 0.90,
+			MinMargin:           0.20,
+			MaxLength:           128,
+			TimeoutMs:           1500,
+			NumThreads:          4,
+			DictPath:            "",
+		},
 		Notifications: NotificationsConfig{
 			Start:             true,
 			Success:           true,
@@ -195,6 +253,65 @@ func RuntimeLibDir() string {
 
 func ConfigPath() string {
 	return filepath.Join(AppDir(), "config.yaml")
+}
+
+// DefaultCorrectionsDictPath is the correction dictionary location used when
+// Corrections.DictPath is left empty: corrections.txt next to the config file.
+func DefaultCorrectionsDictPath() string {
+	return filepath.Join(AppDir(), "corrections.txt")
+}
+
+// DefaultCorrectionsModelDir is the root holding the two optional correction
+// model bundles.
+func DefaultCorrectionsModelDir() string {
+	return filepath.Join(DefaultModelDir(), "correction")
+}
+
+// CorrectionsDictPath returns the effective correction dictionary path,
+// falling back to the default location when the config leaves DictPath empty.
+func (c *Config) CorrectionsDictPath() string {
+	if c.Corrections.DictPath != "" {
+		return c.Corrections.DictPath
+	}
+	return DefaultCorrectionsDictPath()
+}
+
+// CorrectionsModelDir returns the effective correction-model root.
+func (c *Config) CorrectionsModelDir() string {
+	if c.Corrections.ModelDir != "" {
+		return c.Corrections.ModelDir
+	}
+	return DefaultCorrectionsModelDir()
+}
+
+// CorrectionModelPaths resolves a supported strategy to its ONNX and BERT
+// vocabulary files.
+func (c *Config) CorrectionModelPaths(strategy string) (CorrectionModelFiles, error) {
+	set := models.ForCorrectionStrategy(strategy)
+	if len(set) == 0 {
+		return CorrectionModelFiles{}, fmt.Errorf("unknown correction strategy %q", strategy)
+	}
+	base := filepath.Join(c.CorrectionsModelDir(), set[0].Dir)
+	return CorrectionModelFiles{
+		Model: filepath.Join(base, "model.int8.onnx"),
+		Vocab: filepath.Join(base, "vocab.txt"),
+	}, nil
+}
+
+// CorrectionsRuntimePath returns the configured ONNX Runtime library or the
+// platform-specific library in the packaged runtime directory.
+func (c *Config) CorrectionsRuntimePath() string {
+	if c.Corrections.RuntimePath != "" {
+		return c.Corrections.RuntimePath
+	}
+	name := "libonnxruntime.so"
+	switch runtime.GOOS {
+	case "darwin":
+		name = "libonnxruntime.dylib"
+	case "windows":
+		name = "onnxruntime.dll"
+	}
+	return filepath.Join(RuntimeLibDir(), name)
 }
 
 func legacyConfigPath() string {

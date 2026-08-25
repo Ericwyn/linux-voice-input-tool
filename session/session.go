@@ -6,12 +6,14 @@
 package session
 
 import (
+	"context"
 	"log"
 	"sync"
 	"time"
 
 	"linux-voice-input/audio"
 	"linux-voice-input/config"
+	"linux-voice-input/corrector"
 	"linux-voice-input/engine"
 	"linux-voice-input/input"
 	"linux-voice-input/notify"
@@ -44,6 +46,10 @@ type Controller struct {
 	// preloaded records whether Preload succeeded, so Reload knows whether to
 	// re-preload the rebuilt engine.
 	preloaded bool
+
+	// correctionService owns the optional neural model and final user
+	// dictionary. It is engine-agnostic and runs exactly once after Finish.
+	correctionService *corrector.Service
 
 	// Active recording session state.
 	recording bool
@@ -82,7 +88,46 @@ func New(cfg *config.Config) *Controller {
 		log.Printf("Engine init failed: %v", err)
 	}
 	c.engine = eng
+	c.correctionService = newCorrectionService(cfg)
 	return c
+}
+
+// newCorrectionService builds the configured model+dictionary pipeline. An
+// invalid model name degrades to dictionary-only instead of disabling all
+// user corrections.
+func newCorrectionService(cfg *config.Config) *corrector.Service {
+	service, err := corrector.NewServiceFromConfig(cfg)
+	if err != nil {
+		log.Printf("Correction model configuration unavailable, using dictionary only: %v", err)
+		fallback := *cfg
+		fallback.Corrections.Strategy = ""
+		service, _ = corrector.NewServiceFromConfig(&fallback)
+	}
+	if cfg.Corrections.Enabled {
+		log.Printf("Text corrections enabled: strategy=%q dictionary=%s",
+			cfg.Corrections.Strategy, cfg.CorrectionsDictPath())
+	}
+	return service
+}
+
+// CorrectionsEnabled reports the live service state.
+func (c *Controller) CorrectionsEnabled() bool {
+	c.mu.Lock()
+	service := c.correctionService
+	c.mu.Unlock()
+	return service != nil && service.Enabled()
+}
+
+// SetCorrectionsEnabled changes only the post-processing service. It does not
+// rebuild or reload the ASR engine, so it is safe for the tray checkbox.
+func (c *Controller) SetCorrectionsEnabled(enabled bool) {
+	c.mu.Lock()
+	c.cfg.Corrections.Enabled = enabled
+	service := c.correctionService
+	c.mu.Unlock()
+	if service != nil {
+		service.SetEnabled(enabled)
+	}
 }
 
 // Preload eagerly loads the engine's heavy resources once so that subsequent
@@ -395,7 +440,38 @@ func (c *Controller) transcribe(recorder *audio.Recorder, activeSession engine.S
 		log.Printf("Transcription failed: %v", err)
 		return ""
 	}
-	return text
+
+	return c.applyCorrections(text)
+}
+
+// applyCorrections runs the engine-agnostic final-text service with a bounded
+// context. ONNX calls cannot be force-cancelled mid-kernel; model strategies
+// observe the deadline before/after Run, while the cheap final dictionary is
+// still allowed to execute as a deterministic fallback.
+func (c *Controller) applyCorrections(text string) string {
+	c.mu.Lock()
+	service := c.correctionService
+	timeoutMs := c.cfg.Corrections.TimeoutMs
+	c.mu.Unlock()
+	if service == nil || !service.Enabled() || text == "" {
+		return text
+	}
+
+	ctx := context.Background()
+	cancel := func() {}
+	if timeoutMs > 0 {
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
+	}
+	result := service.Correct(ctx, text)
+	cancel()
+	for _, failure := range result.Failures {
+		log.Printf("Correction strategy %s failed: %v", failure.Strategy, failure.Err)
+	}
+	if result.Text != text {
+		log.Printf("Corrected in %dms via %v: %s -> %s",
+			result.Duration.Milliseconds(), result.Applied, text, result.Text)
+	}
+	return result.Text
 }
 
 // Reload swaps the configuration and rebuilds the engine if needed. It is
@@ -418,6 +494,13 @@ func (c *Controller) Reload(cfg *config.Config) error {
 	}
 	c.preloaded = false
 	c.cfg = cfg
+
+	// Rebuild the correction pipeline so model, threshold and dictionary changes
+	// take effect. The heavy ONNX session remains lazy until first use.
+	if c.correctionService != nil {
+		_ = c.correctionService.Close()
+	}
+	c.correctionService = newCorrectionService(cfg)
 
 	eng, err := engine.New(cfg)
 	if err != nil {
@@ -449,6 +532,10 @@ func (c *Controller) Close() {
 	defer c.mu.Unlock()
 	if c.engine != nil {
 		c.engine.Close()
+	}
+	if c.correctionService != nil {
+		_ = c.correctionService.Close()
+		c.correctionService = nil
 	}
 	c.preloaded = false
 }

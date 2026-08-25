@@ -1,3 +1,5 @@
 linux-voice-input
 .idea/
 *.log
+__pycache__/
+*.py[cod]

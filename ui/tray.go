@@ -14,6 +14,7 @@ import (
 //	状态: 空闲                 (disabled when idle; clickable to cancel while recording)
 //	---
 //	启用热键监听               (checkbox)
+//	启用语音纠错               (checkbox)
 //	---
 //	sensevoice|sherpa|whisper   (checkboxes; only the active engine is checked)
 //	---
@@ -43,6 +44,9 @@ func (a *App) setupTray() {
 	a.hotkeyItem = menu.AddCheckbox("启用热键监听", a.HotkeyEnabled(), func() {
 		a.toggleHotkey()
 	})
+	a.correctionsItem = menu.AddCheckbox("启用语音纠错", a.CorrectionsEnabled(), func() {
+		a.toggleCorrections()
+	})
 
 	menu.AddSeparator()
 
@@ -69,7 +73,7 @@ func (a *App) setupTray() {
 
 	// Version line: a disabled, non-clickable informational item so users can
 	// see the running version without opening a terminal.
-	versionItem := menu.Add("v" + version.Version, nil)
+	versionItem := menu.Add("v"+version.Version, nil)
 	versionItem.SetDisabled(true)
 
 	menu.Add("退出", func() { a.Quit() })

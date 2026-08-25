@@ -67,6 +67,86 @@ var senseVoiceModels = []Model{
 	},
 }
 
+// Correction strategy identifiers are shared with config and the local model
+// factory. Keeping their model bundles here makes every download URL live next
+// to the existing ASR/punctuation/runtime URLs rather than being duplicated in
+// CLI and tray code.
+const (
+	CorrectionStrategyMDCSpell = "macbert-mdcspell-v2"
+	CorrectionStrategyMacBERT  = "macbert4csc"
+)
+
+var correctionModels = map[string]Model{
+	CorrectionStrategyMDCSpell: {
+		Label: "中文纠错 MDCSpell-v2 (INT8)",
+		Dir:   "macbert-mdcspell-v2",
+		URL:   "https://github.com/Ericwyn/linux-voice-input-tool/releases/download/correction-models-int8-v1/macbert-mdcspell-v2-int8-onnx.tar.bz2",
+		Files: []string{"model.int8.onnx", "vocab.txt"},
+	},
+	CorrectionStrategyMacBERT: {
+		Label: "中文纠错 MacBERT4CSC (INT8)",
+		Dir:   "macbert4csc",
+		URL:   "https://github.com/Ericwyn/linux-voice-input-tool/releases/download/correction-models-int8-v1/macbert4csc-int8-onnx.tar.bz2",
+		Files: []string{"model.int8.onnx", "vocab.txt"},
+	},
+}
+
+// ForCorrectionStrategy returns the one model bundle needed by the selected
+// neural correction strategy. Empty/unknown names return nil; an empty name is
+// the supported dictionary-only mode.
+func ForCorrectionStrategy(strategy string) []Model {
+	model, ok := correctionModels[strategy]
+	if !ok {
+		return nil
+	}
+	model.Files = append([]string(nil), model.Files...)
+	return []Model{model}
+}
+
+// DownloadRequest describes all optional model families required by the live
+// configuration without importing config (which already imports models).
+type DownloadRequest struct {
+	EngineName         string
+	EngineBaseDir      string
+	CorrectionsEnabled bool
+	CorrectionStrategy string
+	CorrectionBaseDir  string
+}
+
+// DownloadGroup is one model set sharing an extraction base directory.
+type DownloadGroup struct {
+	Label   string
+	BaseDir string
+	Models  []Model
+}
+
+// RequiredDownloads returns the recognition and correction groups that should
+// be checked/downloaded for a configuration. A remote whisper engine may still
+// need a local correction model. Dictionary-only correction adds no group.
+func RequiredDownloads(request DownloadRequest) ([]DownloadGroup, error) {
+	var groups []DownloadGroup
+	if set := ForEngine(request.EngineName); len(set) > 0 {
+		groups = append(groups, DownloadGroup{
+			Label:   "识别模型",
+			BaseDir: request.EngineBaseDir,
+			Models:  set,
+		})
+	}
+	if !request.CorrectionsEnabled || request.CorrectionStrategy == "" {
+		return groups, nil
+	}
+	set := ForCorrectionStrategy(request.CorrectionStrategy)
+	if len(set) == 0 {
+		return nil, fmt.Errorf("unknown correction strategy %q", request.CorrectionStrategy)
+	}
+	groups = append(groups, DownloadGroup{
+		Label:   "中文纠错模型",
+		BaseDir: request.CorrectionBaseDir,
+		Models:  set,
+	})
+	return groups, nil
+}
+
 // ForEngine returns the model bundles a given engine needs under the base
 // directory. Engines that use no local models (e.g. the remote whisper API, or
 // an unknown engine name) return nil, for which Check and DownloadMissing are
