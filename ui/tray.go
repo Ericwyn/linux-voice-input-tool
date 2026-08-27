@@ -15,6 +15,8 @@ import (
 //	---
 //	启用热键监听               (checkbox)
 //	启用语音纠错               (checkbox)
+//	启用语音统计               (checkbox)
+//	查看语音统计
 //	---
 //	sensevoice|sherpa|whisper   (checkboxes; only the active engine is checked)
 //	---
@@ -47,6 +49,10 @@ func (a *App) setupTray() {
 	a.correctionsItem = menu.AddCheckbox("启用语音纠错", a.CorrectionsEnabled(), func() {
 		a.toggleCorrections()
 	})
+	a.statisticsItem = menu.AddCheckbox("启用语音统计", a.StatisticsEnabled(), func() {
+		a.toggleStatistics()
+	})
+	menu.Add("查看语音统计", func() { a.showStatistics() })
 
 	menu.AddSeparator()
 

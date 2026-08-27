@@ -116,6 +116,13 @@ type AudioConfig struct {
 	SampleRate int `yaml:"sample_rate"`
 }
 
+// StatisticsConfig controls privacy-preserving local usage aggregation. The
+// data directory is intentionally fixed under AppDir so configuration only
+// needs an opt-in switch and historical files remain easy to find.
+type StatisticsConfig struct {
+	Enabled bool `yaml:"enabled"`
+}
+
 type NotificationsConfig struct {
 	Start             bool `yaml:"start"`
 	Success           bool `yaml:"success"`
@@ -141,6 +148,7 @@ type Config struct {
 	Audio            AudioConfig         `yaml:"audio"`
 	Notifications    NotificationsConfig `yaml:"notifications"`
 	Corrections      CorrectionsConfig   `yaml:"corrections"`
+	Statistics       StatisticsConfig    `yaml:"statistics"`
 	RestoreClipboard bool                `yaml:"restore_clipboard"`
 	// Hotkey is the global hotkey combination that toggles recording,
 	// e.g. "alt+shift+g". Modifiers: ctrl/alt/shift/super.
@@ -212,6 +220,9 @@ func DefaultConfig() *Config {
 			NumThreads:          4,
 			DictPath:            "",
 		},
+		Statistics: StatisticsConfig{
+			Enabled: false,
+		},
 		Notifications: NotificationsConfig{
 			Start:             true,
 			Success:           true,
@@ -253,6 +264,11 @@ func RuntimeLibDir() string {
 
 func ConfigPath() string {
 	return filepath.Join(AppDir(), "config.yaml")
+}
+
+// StatsDir returns the root containing YYYY/MM/DD.json aggregate files.
+func StatsDir() string {
+	return filepath.Join(AppDir(), "stats")
 }
 
 // DefaultCorrectionsDictPath is the correction dictionary location used when

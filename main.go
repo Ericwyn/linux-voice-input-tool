@@ -18,6 +18,7 @@ import (
 	"linux-voice-input/corrector"
 	"linux-voice-input/doctor"
 	"linux-voice-input/engine"
+	"linux-voice-input/input"
 	"linux-voice-input/models"
 	"linux-voice-input/session"
 	"linux-voice-input/ui"
@@ -112,6 +113,14 @@ func setupLogging() *os.File {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--clipboard-owner-helper" {
+		if err := input.ServeClipboardOwner(os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stdout, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	logFile := setupLogging()
 	if logFile != nil {
@@ -156,6 +165,12 @@ func main() {
 		return
 	case modeCheckConfig:
 		runCheckConfig(cfg)
+		return
+	case modeStats:
+		if err := runStatsMode(cfg, os.Args[1:], os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "读取语音输入统计失败: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -295,6 +310,7 @@ const (
 	modeTest
 	modeDownloadModels
 	modeCheckConfig
+	modeStats
 	modeVersion
 )
 
@@ -315,6 +331,8 @@ func parseMode(args []string) runMode {
 			return modeDownloadModels
 		case "--check-config":
 			return modeCheckConfig
+		case "--stats":
+			return modeStats
 		}
 	}
 	// No recognized arguments: show help rather than silently recording.
@@ -335,6 +353,7 @@ func printUsage() {
   --test             测试模式：录音 3 秒并识别，用于验证配置是否正确
   --download-models  下载当前配置所需的识别模型、纠错模型与运行库
   --check-config     检查配置与环境依赖，并打印报告
+  --stats            查看统计；可附加 --days N 或 --month YYYY-MM
   -v, --version      显示版本号
   -h, --help         显示本帮助信息（无参数时默认显示）
 

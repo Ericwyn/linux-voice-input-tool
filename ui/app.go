@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gogpu/systray"
 
@@ -23,6 +24,7 @@ import (
 	"linux-voice-input/models"
 	"linux-voice-input/notify"
 	"linux-voice-input/session"
+	"linux-voice-input/stats"
 )
 
 // engineNames is the fixed set of selectable engines, in tray display order.
@@ -46,6 +48,7 @@ type App struct {
 	statusItem      *systray.MenuItem
 	hotkeyItem      *systray.MenuItem
 	correctionsItem *systray.MenuItem
+	statisticsItem  *systray.MenuItem
 	engineItems     map[string]*systray.MenuItem
 	downloadItem    *systray.MenuItem
 
@@ -218,6 +221,87 @@ func (a *App) notifyCorrectionToggle(enabled bool, cfg *config.Config) {
 		return
 	}
 	notify.NotifyAux("语音纠错", "已启用，模型已就绪", true)
+}
+
+// StatisticsEnabled reports whether successful voice-input pastes are being
+// aggregated in the live UI configuration.
+func (a *App) StatisticsEnabled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.Statistics.Enabled
+}
+
+// toggleStatistics changes collection only: disabling it keeps every existing
+// daily file intact so a later re-enable continues the historical series.
+func (a *App) toggleStatistics() {
+	a.mu.Lock()
+	enabled := !a.cfg.Statistics.Enabled
+	a.cfg.Statistics.Enabled = enabled
+	cfgCopy := *a.cfg
+	saveConfig := a.saveConfig
+	a.mu.Unlock()
+
+	a.controller.SetStatisticsEnabled(enabled)
+	if saveConfig == nil {
+		saveConfig = config.Save
+	}
+	if err := saveConfig(&cfgCopy); err != nil {
+		log.Printf("Save statistics toggle failed: %v", err)
+	}
+	if a.statisticsItem != nil {
+		a.statisticsItem.SetChecked(enabled)
+	}
+	if a.tray != nil {
+		message := "已暂停，历史数据保留"
+		if enabled {
+			message = "已启用，只记录成功输入的匿名汇总"
+		}
+		notify.NotifyAux("语音输入统计", message, true)
+	}
+	log.Printf("Voice input statistics enabled=%v", enabled)
+}
+
+// showStatistics flushes this process's pending event queue, then reads only
+// the daily shards needed for today's and the rolling 30-day summaries.
+func (a *App) showStatistics() {
+	go func() {
+		if err := a.controller.FlushStatistics(); err != nil {
+			log.Printf("Flush statistics before view failed: %v", err)
+			notify.NotifyAux("语音输入统计", "保存统计失败: "+err.Error(), true)
+			return
+		}
+
+		now := time.Now()
+		today, err := stats.LoadRecent(config.StatsDir(), now, 1)
+		if err != nil {
+			log.Printf("Read today's statistics failed: %v", err)
+			notify.NotifyAux("语音输入统计", "读取统计失败: "+err.Error(), true)
+			return
+		}
+		recent, err := stats.LoadRecent(config.StatsDir(), now, 30)
+		if err != nil {
+			log.Printf("Read recent statistics failed: %v", err)
+			notify.NotifyAux("语音输入统计", "读取统计失败: "+err.Error(), true)
+			return
+		}
+
+		a.mu.Lock()
+		enabled := a.cfg.Statistics.Enabled
+		a.mu.Unlock()
+		notify.NotifyAux("语音输入统计", formatStatisticsView(enabled, today, recent), true)
+	}()
+}
+
+func formatStatisticsView(enabled bool, today, recent stats.Aggregate) string {
+	state := "已暂停"
+	if enabled {
+		state = "已启用"
+	}
+	return fmt.Sprintf("状态: %s\n今日: %s\n最近30天: %s",
+		state,
+		stats.FormatCounters(today.Totals),
+		stats.FormatCounters(recent.Totals),
+	)
 }
 
 // selectEngine switches the active recognition engine from the tray: it persists
@@ -451,6 +535,7 @@ func (a *App) reloadConfig() {
 		engineName := newCfg.Engine
 		hotkeyEnabled := newCfg.HotkeyEnabled
 		correctionsEnabled := newCfg.Corrections.Enabled
+		statisticsEnabled := newCfg.Statistics.Enabled
 		a.mu.Unlock()
 
 		if err := a.controller.Reload(newCfg); err != nil {
@@ -463,6 +548,9 @@ func (a *App) reloadConfig() {
 		}
 		if a.correctionsItem != nil {
 			a.correctionsItem.SetChecked(correctionsEnabled)
+		}
+		if a.statisticsItem != nil {
+			a.statisticsItem.SetChecked(statisticsEnabled)
 		}
 		notify.NotifyAux("语音输入", "配置已重载", true)
 	}()

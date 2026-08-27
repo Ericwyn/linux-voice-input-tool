@@ -1,6 +1,7 @@
 package input
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -24,23 +25,42 @@ func FocusWindow(windowID string) error {
 	return exec.Command("xdotool", "windowactivate", "--sync", windowID).Run()
 }
 
-func PasteText(text string, restoreClipboard bool, targetWindow string) error {
-	var oldClip string
+// PasteResult identifies when text was actually injected into the target
+// window. InsertedAt is captured immediately after xdotool successfully emits
+// Ctrl+V, before the optional clipboard-restoration delay.
+type PasteResult struct {
+	InsertedAt            time.Time
+	ClipboardRestoreError error
+}
+
+func PasteText(text string, restoreClipboard bool, targetWindow string) (PasteResult, error) {
+	var snapshot clipboardSnapshot
 	if restoreClipboard {
-		out, _ := exec.Command("xclip", "-selection", "clipboard", "-o").Output()
-		oldClip = string(out)
+		var err error
+		snapshot, err = captureClipboard()
+		if err != nil {
+			return PasteResult{}, fmt.Errorf("back up clipboard: %w", err)
+		}
 	}
 
-	cmd := exec.Command("xclip", "-selection", "clipboard")
-	cmd.Stdin = strings.NewReader(text)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("write to clipboard: %w", err)
+	owner, err := startClipboardOwner(text)
+	if err != nil {
+		return PasteResult{}, fmt.Errorf("write to clipboard: %w", err)
+	}
+	restoreAfterFailure := func(operationErr error) error {
+		if !restoreClipboard {
+			return operationErr
+		}
+		if restoreErr := owner.restore(snapshot); restoreErr != nil {
+			return errors.Join(operationErr, fmt.Errorf("restore clipboard: %w", restoreErr))
+		}
+		return operationErr
 	}
 
 	// Focus back to the original window
 	if targetWindow != "" {
 		if err := FocusWindow(targetWindow); err != nil {
-			return fmt.Errorf("focus target window: %w", err)
+			return PasteResult{}, restoreAfterFailure(fmt.Errorf("focus target window: %w", err))
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -51,15 +71,17 @@ func PasteText(text string, restoreClipboard bool, targetWindow string) error {
 	time.Sleep(50 * time.Millisecond)
 
 	if err := exec.Command("xdotool", "key", "--clearmodifiers", "ctrl+v").Run(); err != nil {
-		return fmt.Errorf("simulate paste: %w", err)
+		return PasteResult{}, restoreAfterFailure(fmt.Errorf("simulate paste: %w", err))
+	}
+	result := PasteResult{InsertedAt: time.Now()}
+
+	if restoreClipboard {
+		// Most clients request the data immediately after Ctrl+V. Waiting for an
+		// actual payload request avoids the old fixed 800 ms race; the timeout is
+		// only a fallback for unusual clients that do not request clipboard data.
+		owner.waitUntilServed(clipboardRequestTimeout)
+		result.ClipboardRestoreError = owner.restore(snapshot)
 	}
 
-	if restoreClipboard && oldClip != "" {
-		time.Sleep(800 * time.Millisecond)
-		cmd := exec.Command("xclip", "-selection", "clipboard")
-		cmd.Stdin = strings.NewReader(oldClip)
-		cmd.Run()
-	}
-
-	return nil
+	return result, nil
 }

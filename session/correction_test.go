@@ -31,8 +31,8 @@ func TestControllerApplyCorrections(t *testing.T) {
 	})
 	controller := &Controller{cfg: cfg, correctionService: service}
 
-	if got := controller.applyCorrections("input"); got != "input-corrected" {
-		t.Fatalf("applyCorrections() = %q", got)
+	if got := controller.applyCorrections("input"); got.Text != "input-corrected" {
+		t.Fatalf("applyCorrections() = %#v", got)
 	}
 }
 
@@ -47,8 +47,8 @@ func TestControllerCorrectionFailureKeepsText(t *testing.T) {
 	})
 	controller := &Controller{cfg: cfg, correctionService: service}
 
-	if got := controller.applyCorrections("input"); got != "input" {
-		t.Fatalf("applyCorrections() = %q, want fail-open original", got)
+	if got := controller.applyCorrections("input"); got.Text != "input" {
+		t.Fatalf("applyCorrections() = %#v, want fail-open original", got)
 	}
 }
 

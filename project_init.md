@@ -10,7 +10,7 @@
 - UI 框架：Fyne v2
 - 音频录制：PortAudio (通过 `github.com/gordonklaus/portaudio`)
 - 语音识别：OpenAI Whisper API
-- 文字输入：xclip + xdotool
+- 文字输入：xgb（X11 剪贴板）+ xdotool
 
 ## 整体流程
 
@@ -36,7 +36,7 @@
 获取识别文本
         │
         ▼
-xclip 写入剪贴板 + xdotool 模拟 Ctrl+V 粘贴
+xgb 发布剪贴板内容 + xdotool 模拟 Ctrl+V 粘贴
         │
         ▼
 关闭窗口，完成输入
@@ -136,35 +136,32 @@ curl --request POST \
 
 **扩展性：** 由于接口格式与 OpenAI Whisper 兼容，更换 `api_base` 和 `model` 即可切换到其他兼容服务。
 
-### 5. 文字输入 (xclip + xdotool)
+### 5. 文字输入（xgb + xdotool）
 
 **系统依赖：**
 ```bash
-sudo apt install xclip xdotool
+sudo apt install xdotool
 ```
 
 **实现逻辑：**
 ```go
-// 1. 保存当前剪贴板内容 (可选，用于恢复)
-oldClip := exec.Command("xclip", "-selection", "clipboard", "-o").Output()
+// 1. 通过 X11 TARGETS 保存当前剪贴板的所有可恢复格式
+snapshot, err := captureClipboard()
 
-// 2. 将识别文本写入剪贴板
-cmd := exec.Command("xclip", "-selection", "clipboard")
-cmd.Stdin = strings.NewReader(recognizedText)
-cmd.Run()
+// 2. 成为 CLIPBOARD owner，并提供 UTF8_STRING/text/plain 等文本 target
+owner, err := startClipboardOwner(recognizedText)
 
-// 3. 短暂延迟，确保剪贴板就绪
-time.Sleep(50 * time.Millisecond)
-
-// 4. 模拟 Ctrl+V 粘贴
+// 3. 模拟 Ctrl+V 粘贴
 exec.Command("xdotool", "key", "--clearmodifiers", "ctrl+v").Run()
 
-// 5. 恢复原剪贴板内容 (可选)
+// 4. 目标窗口读取完成后，恢复原 target/type/format/二进制内容
+owner.restore(snapshot)
 ```
 
-**为什么用 xclip+xdotool 而不是 xdotool type：**
+**为什么用 X11 剪贴板 + xdotool 而不是 xdotool type：**
 - `xdotool type` 对中文支持差，依赖输入法状态
 - 剪贴板方案绕过输入法，直接粘贴 UTF-8 文本，兼容性最好
+- 使用 `xgb` 可保留图片、HTML、文件列表等多 target 内容，并移除 `xclip` 运行时依赖
 
 ### 6. 配置文件
 
@@ -203,7 +200,8 @@ linux-voice-input/
 ├── api/
 │   └── whisper.go       # Whisper API 调用
 ├── input/
-│   └── paste.go         # xclip + xdotool 输入
+│   ├── clipboard_x11.go # xgb 剪贴板快照、owner 与恢复
+│   └── paste.go         # xdotool 聚焦与粘贴
 ├── hotkey/
 │   └── hotkey.go        # 全局快捷键监听
 ├── ui/
@@ -217,12 +215,13 @@ linux-voice-input/
 |----|------|
 | `fyne.io/fyne/v2` | UI 框架 |
 | `github.com/gordonklaus/portaudio` | 音频录制 |
+| `github.com/BurntSushi/xgb` | X11 剪贴板协议 |
 | `github.com/BurntSushi/xgbutil` | X11 全局快捷键 |
 | `gopkg.in/yaml.v3` | 配置文件解析 |
 
 **系统依赖：**
 ```bash
-sudo apt install portaudio19-dev xclip xdotool libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libgl1-mesa-dev libxxf86vm-dev
+sudo apt install portaudio19-dev xdotool libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libgl1-mesa-dev libxxf86vm-dev
 ```
 
 ## 已确认方案
@@ -239,6 +238,6 @@ sudo apt install portaudio19-dev xclip xdotool libx11-dev libxcursor-dev libxran
 1. 初始化项目 + 配置模块
 2. 音频录制模块
 3. Whisper API 调用
-4. xclip/xdotool 输入模块
+4. xgb/xdotool 输入模块
 5. Fyne UI 窗口
 6. 全局快捷键 + 串联所有模块

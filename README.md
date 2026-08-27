@@ -22,6 +22,7 @@
   - [图形界面（守护进程 + 托盘）](#图形界面守护进程--托盘)
   - [Ubuntu 快捷键](#ubuntu-快捷键)
 - [配置](#配置)
+  - [本地语音输入统计](#本地语音输入统计)
 - [排查问题](#排查问题)
 - [其他](#其他)
 
@@ -37,6 +38,7 @@
 - 📦 **一键下载模型**：内置 `--download-models`，带下载进度和速度显示。
 - 🩺 **配置自检**：`--check-config` 一键检查环境依赖与模型是否就绪。
 - ✍️ **本地中文纠错**：可选 INT8 MacBERT/MDCSpell 模型 + 用户词典，最终粘贴前离线纠错，托盘即时开关。
+- 📊 **本地使用统计**：可选记录成功输入的匿名日汇总、字数、录音/端到端耗时和自动纠错数据，不保存输入文本。
 
 ---
 
@@ -85,15 +87,15 @@ Ubuntu / Debian：
 ```bash
 sudo apt install -y \
   portaudio19-dev \
-  xclip \
   xdotool
 ```
 
 | 依赖 | 用途 |
 | --- | --- |
 | `portaudio19-dev` | 麦克风录音（编译时需要） |
-| `xclip` | 写入 X11 剪贴板 |
 | `xdotool` | 获取 / 激活窗口并模拟 `Ctrl+V` |
+
+X11 剪贴板读写由程序通过 Go 的 `xgb` 依赖直接完成，不需要安装 `xclip`。
 
 桌面通知直接通过会话总线的 freedesktop `org.freedesktop.Notifications` D-Bus 接口发送，无需 `gdbus`，兼容 GNOME / KDE / XFCE / dunst 等任意符合规范的通知服务。若会话总线不可用，会退化到 `notify-send`（来自 `libnotify-bin`）作为可选兜底，需要时再安装即可：
 
@@ -101,7 +103,7 @@ sudo apt install -y \
 sudo apt install -y libnotify-bin
 ```
 
-> 当前优先支持 **X11**。Wayland 下 `xclip` / `xdotool` 可能不可用，建议使用 X11 会话。
+> 当前优先支持 **X11**。Wayland 下 X11 剪贴板和 `xdotool` 不可用，建议使用 X11 会话。
 
 ### 2. 构建
 
@@ -263,11 +265,20 @@ linux-voice-input [选项]
   --test             测试模式：录音 3 秒并识别，用于验证配置是否正确
   --download-models  下载当前配置所需的识别模型、纠错模型与运行库
   --check-config     检查配置与环境依赖，并打印报告
+  --stats            查看统计；可附加 --days N 或 --month YYYY-MM
   -v, --version      显示版本号
   -h, --help         显示本帮助信息（无参数时默认显示）
 ```
 
 > 从 v0.1.0 起，无参数运行会显示帮助信息；触发录音请使用 `--record`（Ubuntu 快捷键也应绑定到 `--record`）。
+
+统计查询示例：
+
+```bash
+linux-voice-input --stats                    # 今日、最近 7/30 天、全部累计
+linux-voice-input --stats --days 30          # 最近 30 个本地自然日
+linux-voice-input --stats --month 2026-08    # 指定月份
+```
 
 `--download-models` 输出示例（先下模型，再补运行库到二进制同目录的 `lib/`）：
 
@@ -288,7 +299,6 @@ linux-voice-input [选项]
 ```text
 配置与环境检查:
   [✓] 显示服务器: X11
-  [✓] xclip: /usr/bin/xclip
   [✓] xdotool: /usr/bin/xdotool
   [✓] 桌面通知: D-Bus 通知服务可用
   [✓] 配置文件: /home/user/.linux-voice-input/config.yaml
@@ -314,12 +324,13 @@ linux-voice-input [选项]
   - **状态显示**（空闲 / 录音中…）
   - **启用热键监听**（勾选切换，立即生效并保存）
   - **启用语音纠错**（勾选切换，立即生效并保存，不重载 ASR）
+  - **启用语音统计 / 查看语音统计**（匿名日汇总；查看今日与最近 30 天）
   - **sensevoice / sherpa / whisper**（选择识别引擎）
   - **下载模型 / 环境检查**
   - **打开配置目录 / 重载配置**
   - **退出**
 
-更细的模型目录、API Key、热键、通知和纠错参数通过 `~/.linux-voice-input/config.yaml` 配置；保存后点托盘“重载配置”生效。
+更细的模型目录、API Key、热键、通知、纠错和统计参数通过 `~/.linux-voice-input/config.yaml` 配置；保存后点托盘“重载配置”生效。
 
 > **GNOME 托盘图标不显示？** GNOME 默认不显示系统托盘，安装并启用 AppIndicator 扩展：
 >
@@ -387,6 +398,8 @@ corrections:
   timeout_ms: 1500
   num_threads: 4
   dict_path: ""                     # 留空则用 ~/.linux-voice-input/corrections.txt
+statistics:
+  enabled: false                    # 可在托盘“启用语音统计”即时切换
 hotkey: alt+shift+g
 hotkey_enabled: true
 restore_clipboard: true
@@ -445,9 +458,35 @@ whisper:
 | `corrections.timeout_ms` | 单次最终纠错软超时，默认 1500ms |
 | `corrections.num_threads` | 纠错模型 CPU 推理线程数，默认 4 |
 | `corrections.dict_path` | 最后执行的用户词典路径；留空则用 `~/.linux-voice-input/corrections.txt` |
+| `statistics.enabled` | 是否记录成功语音输入的匿名日汇总，默认 `false`；关闭只暂停新增，历史数据保留 |
 | `restore_clipboard` | 粘贴后是否恢复原剪贴板内容 |
 
 > **旧配置自动迁移**：如果你的 `config.yaml` 还是旧的 `api:` 块格式（`api.engine` / `api.key` 等），程序会在加载时自动迁移到新的 `engine` + `whisper` 布局并回写，无需手动改动。
+
+### 本地语音输入统计
+
+统计开启后，只有成功执行 `Ctrl+V` 的语音输入会被计入；取消、过短、空结果、识别失败、粘贴失败和 `--test` 均不统计。统计日文件不会保存识别文本、纠错后文本或逐次输入记录（运行日志仍遵循现有行为）。
+
+每个本地自然日写入一个 JSON 文件，并按年月分目录：
+
+```text
+~/.linux-voice-input/stats/YYYY/MM/DD.json
+```
+
+例如 `~/.linux-voice-input/stats/2026/08/26.json`。每个文件包含当天总计和按识别引擎汇总，主要字段为：
+
+| 字段 | 口径 |
+| --- | --- |
+| `successful_inputs` | 成功粘贴次数 |
+| `characters` | 排除 Unicode 空白后的 rune 数；标点和 emoji 也计入 |
+| `han_characters` | 其中属于 Unicode Han 字符集的汉字数 |
+| `recording_duration_ms` | 开始录音到用户停止录音的累计毫秒数 |
+| `input_duration_ms` | 开始录音到文字实际注入窗口的累计毫秒数，包含识别和纠错，不含剪贴板恢复等待 |
+| `corrected_inputs` | 最终文本被内置模型或用户词典改变的输入次数 |
+| `correction_edits` | 纠错前后文本的 rune 级 Levenshtein 编辑数 |
+| `correction_strategy_inputs` | 每个纠错策略实际产生修改的输入次数 |
+
+日文件是唯一数据源；最近 7/30 天、指定月份和全部累计都在查询时合并，不维护可能与日文件不一致的第二份总计。关闭统计只停止新增文件更新，不删除历史数据。当前只记录客观耗时，不配置传统打字速度，也不计算节省时间，后续分析工具可直接读取这些日文件。
 
 ### 本地中文纠错（模型 + 用户词典）
 
@@ -563,10 +602,10 @@ Docker = 道克, 道客
 **没有自动输入 / 粘贴失败**
 
 1. 确认当前是 X11 会话（`echo $XDG_SESSION_TYPE`）。
-2. 确认已安装 `xclip` 和 `xdotool`。
-3. 手动测试粘贴链路：
+2. 确认已安装 `xdotool`（剪贴板读写已内置，不需要 `xclip`）。
+3. 确认活动窗口和模拟按键可用：
    ```bash
-   echo -n "测试输入" | xclip -selection clipboard && xdotool key --clearmodifiers ctrl+v
+   xdotool getactivewindow
    ```
 4. 查看日志：`tail -f ~/.linux-voice-input/run.log`。
 

@@ -17,6 +17,7 @@ import (
 	"linux-voice-input/engine"
 	"linux-voice-input/input"
 	"linux-voice-input/notify"
+	"linux-voice-input/stats"
 )
 
 // minRecordingDuration guards against accidental double-taps: recordings
@@ -34,6 +35,22 @@ const toggleDebounce = 400 * time.Millisecond
 // server, so updating on every audio frame would overwhelm the session bus.
 const previewNotifyInterval = 300 * time.Millisecond
 
+type statisticsTracker interface {
+	Enabled() bool
+	SetEnabled(bool)
+	Record(stats.Event)
+	Flush() error
+	Close() error
+}
+
+type pasteTextFunc func(text string, restoreClipboard bool, targetWindow string) (input.PasteResult, error)
+
+type transcriptionResult struct {
+	RawText           string
+	Text              string
+	AppliedStrategies []string
+}
+
 // Controller owns the recording lifecycle and drives the recognition engine.
 // All public methods are safe for concurrent use.
 type Controller struct {
@@ -50,6 +67,11 @@ type Controller struct {
 	// correctionService owns the optional neural model and final user
 	// dictionary. It is engine-agnostic and runs exactly once after Finish.
 	correctionService *corrector.Service
+	// statistics owns the opt-in asynchronous daily-file writer. pasteText is a
+	// narrow dependency seam that keeps the success-only recording boundary
+	// testable without invoking the X11 clipboard/xdotool integration.
+	statistics statisticsTracker
+	pasteText  pasteTextFunc
 
 	// Active recording session state.
 	recording bool
@@ -64,6 +86,7 @@ type Controller struct {
 
 	startTime    time.Time
 	targetWindow string
+	activeEngine string
 
 	// lock is the system-wide recording lock held for the current session,
 	// preventing any other process from recording concurrently.
@@ -82,7 +105,11 @@ type Controller struct {
 // is logged and leaves the engine nil; recording will then report an init
 // failure rather than crashing.
 func New(cfg *config.Config) *Controller {
-	c := &Controller{cfg: cfg}
+	c := &Controller{
+		cfg:        cfg,
+		statistics: stats.NewTracker(config.StatsDir(), cfg.Statistics.Enabled),
+		pasteText:  input.PasteText,
+	}
 	eng, err := engine.New(cfg)
 	if err != nil {
 		log.Printf("Engine init failed: %v", err)
@@ -128,6 +155,39 @@ func (c *Controller) SetCorrectionsEnabled(enabled bool) {
 	if service != nil {
 		service.SetEnabled(enabled)
 	}
+}
+
+// StatisticsEnabled reports whether successful pastes are currently being
+// added to the local daily aggregates.
+func (c *Controller) StatisticsEnabled() bool {
+	c.mu.Lock()
+	tracker := c.statistics
+	c.mu.Unlock()
+	return tracker != nil && tracker.Enabled()
+}
+
+// SetStatisticsEnabled pauses or resumes collection without deleting any
+// existing daily files.
+func (c *Controller) SetStatisticsEnabled(enabled bool) {
+	c.mu.Lock()
+	c.cfg.Statistics.Enabled = enabled
+	tracker := c.statistics
+	c.mu.Unlock()
+	if tracker != nil {
+		tracker.SetEnabled(enabled)
+	}
+}
+
+// FlushStatistics waits for events already queued by this controller. It is
+// intended for interactive reads and orderly shutdown, not the paste path.
+func (c *Controller) FlushStatistics() error {
+	c.mu.Lock()
+	tracker := c.statistics
+	c.mu.Unlock()
+	if tracker == nil {
+		return nil
+	}
+	return tracker.Flush()
 }
 
 // Preload eagerly loads the engine's heavy resources once so that subsequent
@@ -234,6 +294,7 @@ func (c *Controller) StartRecording() error {
 	c.recorder = recorder
 	c.recording = true
 	c.startTime = time.Now()
+	c.activeEngine = c.cfg.Engine
 	notify.If(c.cfg.Notifications.Start, "语音输入", "录音中", false)
 
 	if c.engine != nil {
@@ -303,13 +364,20 @@ func (c *Controller) StopAndTranscribe() {
 	feedDone := c.feedDone
 	startTime := c.startTime
 	targetWindow := c.targetWindow
+	engineName := c.activeEngine
 	lock := c.lock
+	stopTime := time.Now()
+	notifications := c.cfg.Notifications
+	restoreClipboard := c.cfg.RestoreClipboard
+	pasteText := c.pasteText
+	statisticsTracker := c.statistics
 
 	c.recording = false
 	c.recorder = nil
 	c.activeSession = nil
 	c.feedDone = nil
 	c.lock = nil
+	c.activeEngine = ""
 	c.mu.Unlock()
 
 	go c.notifyStateChange(false)
@@ -332,7 +400,7 @@ func (c *Controller) StopAndTranscribe() {
 	}()
 
 	if err := recorder.Stop(); err != nil {
-		notify.FinalIf(c.cfg.Notifications.RecordStopFailed, "语音输入", "录音停止失败")
+		notify.FinalIf(notifications.RecordStopFailed, "语音输入", "录音停止失败")
 		log.Printf("Stop recording failed: %v", err)
 		return
 	}
@@ -343,35 +411,83 @@ func (c *Controller) StopAndTranscribe() {
 		<-feedDone
 	}
 
-	duration := time.Since(startTime)
-	log.Printf("Recording stopped, duration: %.3fs", duration.Seconds())
+	recordingDuration := stopTime.Sub(startTime)
+	log.Printf("Recording stopped, duration: %.3fs", recordingDuration.Seconds())
 
-	if duration < minRecordingDuration {
+	if recordingDuration < minRecordingDuration {
 		log.Printf("Recording ignored, shorter than %.3fs", minRecordingDuration.Seconds())
-		notify.FinalIf(c.cfg.Notifications.Ignored, "语音输入", "录音过短，已忽略")
+		notify.FinalIf(notifications.Ignored, "语音输入", "录音过短，已忽略")
 		return
 	}
 
-	text := c.transcribe(recorder, activeSession)
+	transcription := c.transcribe(recorder, activeSession)
 
-	if text == "" {
-		notify.FinalIf(c.cfg.Notifications.EmptyResult, "语音输入", "未识别到内容")
+	if transcription.Text == "" {
+		notify.FinalIf(notifications.EmptyResult, "语音输入", "未识别到内容")
 		log.Println("Empty transcription result")
 		return
 	}
 
-	log.Printf("Transcribed: %s", text)
-	if err := input.PasteText(text, c.cfg.RestoreClipboard, targetWindow); err != nil {
-		notify.FinalIf(c.cfg.Notifications.PasteFailed, "语音输入", "粘贴失败")
+	log.Printf("Transcribed: %s", transcription.Text)
+	pasteResult, err := pasteAndRecordStatistics(
+		pasteText,
+		transcription,
+		restoreClipboard,
+		targetWindow,
+		statisticsTracker,
+		engineName,
+		startTime,
+		recordingDuration,
+	)
+	if err != nil {
+		notify.FinalIf(notifications.PasteFailed, "语音输入", "粘贴失败")
 		log.Printf("Paste failed: %v", err)
+		return
+	}
+	if pasteResult.ClipboardRestoreError != nil {
+		notify.FinalIf(notifications.PasteFailed, "语音输入", "文字已输入，但剪贴板恢复失败")
+		log.Printf("Text was pasted, but clipboard restore failed: %v", pasteResult.ClipboardRestoreError)
 		return
 	}
 
 	// On success the preview already showed the text and it is now in the input
 	// box, so tear the preview down silently; engines without a preview still
 	// get a confirmation notification when enabled.
-	notify.FinalSuccess(c.cfg.Notifications.Success, "语音输入", "已输入："+text)
+	notify.FinalSuccess(notifications.Success, "语音输入", "已输入："+transcription.Text)
 	log.Println("Done")
+}
+
+// pasteAndRecordStatistics makes the success boundary explicit: a statistics
+// event is queued only after the target-window paste succeeds.
+func pasteAndRecordStatistics(
+	pasteText pasteTextFunc,
+	transcription transcriptionResult,
+	restoreClipboard bool,
+	targetWindow string,
+	tracker statisticsTracker,
+	engineName string,
+	startTime time.Time,
+	recordingDuration time.Duration,
+) (input.PasteResult, error) {
+	if pasteText == nil {
+		pasteText = input.PasteText
+	}
+	pasteResult, err := pasteText(transcription.Text, restoreClipboard, targetWindow)
+	if err != nil {
+		return input.PasteResult{}, err
+	}
+	if tracker != nil {
+		tracker.Record(stats.NewEvent(
+			pasteResult.InsertedAt,
+			engineName,
+			transcription.RawText,
+			transcription.Text,
+			recordingDuration,
+			pasteResult.InsertedAt.Sub(startTime),
+			transcription.AppliedStrategies,
+		))
+	}
+	return pasteResult, nil
 }
 
 // Cancel aborts the active recording without transcribing or pasting: it stops
@@ -398,6 +514,7 @@ func (c *Controller) Cancel() {
 	c.activeSession = nil
 	c.feedDone = nil
 	c.lock = nil
+	c.activeEngine = ""
 	c.mu.Unlock()
 
 	go c.notifyStateChange(false)
@@ -425,9 +542,9 @@ func (c *Controller) Cancel() {
 // live preview (e.g. whisper) it emits a "recognizing" notification first,
 // since there was no preview during recording. A recognition error is reported
 // once here and yields empty text.
-func (c *Controller) transcribe(recorder *audio.Recorder, activeSession engine.Session) string {
+func (c *Controller) transcribe(recorder *audio.Recorder, activeSession engine.Session) transcriptionResult {
 	if activeSession == nil {
-		return ""
+		return transcriptionResult{}
 	}
 
 	if c.engine != nil && !c.engine.SupportsPreview() {
@@ -438,23 +555,28 @@ func (c *Controller) transcribe(recorder *audio.Recorder, activeSession engine.S
 	if err != nil {
 		notify.FinalIf(c.cfg.Notifications.TranscribeFailed, "语音输入", "识别失败")
 		log.Printf("Transcription failed: %v", err)
-		return ""
+		return transcriptionResult{}
 	}
 
-	return c.applyCorrections(text)
+	correction := c.applyCorrections(text)
+	return transcriptionResult{
+		RawText:           text,
+		Text:              correction.Text,
+		AppliedStrategies: correction.Applied,
+	}
 }
 
 // applyCorrections runs the engine-agnostic final-text service with a bounded
 // context. ONNX calls cannot be force-cancelled mid-kernel; model strategies
 // observe the deadline before/after Run, while the cheap final dictionary is
 // still allowed to execute as a deterministic fallback.
-func (c *Controller) applyCorrections(text string) string {
+func (c *Controller) applyCorrections(text string) corrector.Result {
 	c.mu.Lock()
 	service := c.correctionService
 	timeoutMs := c.cfg.Corrections.TimeoutMs
 	c.mu.Unlock()
 	if service == nil || !service.Enabled() || text == "" {
-		return text
+		return corrector.Result{Text: text}
 	}
 
 	ctx := context.Background()
@@ -471,7 +593,7 @@ func (c *Controller) applyCorrections(text string) string {
 		log.Printf("Corrected in %dms via %v: %s -> %s",
 			result.Duration.Milliseconds(), result.Applied, text, result.Text)
 	}
-	return result.Text
+	return result
 }
 
 // Reload swaps the configuration and rebuilds the engine if needed. It is
@@ -485,6 +607,9 @@ func (c *Controller) Reload(cfg *config.Config) error {
 	if c.recording {
 		log.Println("Reload skipped: recording in progress")
 		c.cfg = cfg
+		if c.statistics != nil {
+			c.statistics.SetEnabled(cfg.Statistics.Enabled)
+		}
 		return nil
 	}
 
@@ -494,6 +619,9 @@ func (c *Controller) Reload(cfg *config.Config) error {
 	}
 	c.preloaded = false
 	c.cfg = cfg
+	if c.statistics != nil {
+		c.statistics.SetEnabled(cfg.Statistics.Enabled)
+	}
 
 	// Rebuild the correction pipeline so model, threshold and dictionary changes
 	// take effect. The heavy ONNX session remains lazy until first use.
@@ -529,7 +657,6 @@ func (c *Controller) Config() *config.Config {
 // Close releases all held resources. Safe to call multiple times.
 func (c *Controller) Close() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.engine != nil {
 		c.engine.Close()
 	}
@@ -537,5 +664,19 @@ func (c *Controller) Close() {
 		_ = c.correctionService.Close()
 		c.correctionService = nil
 	}
+	if c.statistics != nil {
+		if err := c.statistics.Close(); err != nil {
+			log.Printf("Statistics close failed: %v", err)
+		}
+		c.statistics = nil
+	}
 	c.preloaded = false
+	c.mu.Unlock()
+
+	// A standalone --record process exits immediately after pasting. Hand the
+	// selection to the desktop clipboard manager first so the restored image or
+	// other multi-format content remains available after this process exits.
+	if err := input.PersistClipboard(); err != nil {
+		log.Printf("Clipboard persistence on shutdown failed: %v", err)
+	}
 }

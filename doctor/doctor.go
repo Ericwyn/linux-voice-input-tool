@@ -85,7 +85,7 @@ func checkDisplayServer() Result {
 		return Result{Name: "显示服务器", OK: true, Detail: "X11"}
 	case sessionType == "wayland":
 		return Result{Name: "显示服务器", OK: false,
-			Detail: "检测到 Wayland；xclip/xdotool 粘贴可能不可用，建议使用 X11 会话"}
+			Detail: "检测到 Wayland；X11 剪贴板/xdotool 粘贴不可用，建议使用 X11 会话"}
 	default:
 		return Result{Name: "显示服务器", OK: false,
 			Detail: fmt.Sprintf("无法确定（XDG_SESSION_TYPE=%q, DISPLAY=%q）", sessionType, display)}
@@ -96,7 +96,6 @@ func checkCommands() []Result {
 	var results []Result
 
 	required := []struct{ cmd, purpose string }{
-		{"xclip", "写入剪贴板"},
 		{"xdotool", "聚焦窗口并模拟 Ctrl+V"},
 	}
 	for _, item := range required {
