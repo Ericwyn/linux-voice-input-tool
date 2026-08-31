@@ -116,6 +116,26 @@ func TestX11ClipboardOwnerRoundTripOnPrivateSelection(t *testing.T) {
 		}
 	}
 
+	// Some real clipboard owners include a target in TARGETS but answer its
+	// conversion request with Property=None. Advertise such a target without a
+	// matching payload and verify that the readable formats are still captured.
+	refusedTarget := internTestAtom(t, ownerConn, "application/x-linux-voice-input-refused")
+	owner.mu.Lock()
+	owner.order = append(owner.order, refusedTarget)
+	owner.mu.Unlock()
+	capturedText, err := captureClipboardWithConnection(requester)
+	if err != nil {
+		t.Fatalf("capture clipboard with one refused target: %v", err)
+	}
+	if len(capturedText.Payloads) != 5 {
+		t.Fatalf("captured text payload count = %d, want 5 readable formats", len(capturedText.Payloads))
+	}
+	for _, payload := range capturedText.Payloads {
+		if payload.Target == refusedTarget {
+			t.Fatal("refused target was included in clipboard snapshot")
+		}
+	}
+
 	imageTarget := internTestAtom(t, ownerConn, "image/png")
 	htmlTarget := internTestAtom(t, ownerConn, "text/html")
 	largeImage := make([]byte, owner.maxPayload+32*1024)

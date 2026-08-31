@@ -459,7 +459,7 @@ whisper:
 | `corrections.num_threads` | 纠错模型 CPU 推理线程数，默认 4 |
 | `corrections.dict_path` | 最后执行的用户词典路径；留空则用 `~/.linux-voice-input/corrections.txt` |
 | `statistics.enabled` | 是否记录成功语音输入的匿名日汇总，默认 `false`；关闭只暂停新增，历史数据保留 |
-| `restore_clipboard` | 粘贴后是否恢复原剪贴板内容 |
+| `restore_clipboard` | 粘贴后是否尽量恢复原剪贴板内容；旧剪贴板无法完整读取时仍会优先输入识别文字 |
 
 > **旧配置自动迁移**：如果你的 `config.yaml` 还是旧的 `api:` 块格式（`api.engine` / `api.key` 等），程序会在加载时自动迁移到新的 `engine` + `whisper` 布局并回写，无需手动改动。
 

@@ -33,22 +33,64 @@ type PasteResult struct {
 	ClipboardRestoreError error
 }
 
+type pasteClipboardOwner interface {
+	restore(clipboardSnapshot) error
+	waitUntilServed(time.Duration)
+}
+
+type pasteRuntime struct {
+	captureClipboard    func() (clipboardSnapshot, error)
+	startClipboardOwner func(string) (pasteClipboardOwner, error)
+	focusWindow         func(string) error
+	releaseModifiers    func()
+	simulatePaste       func() error
+	sleep               func(time.Duration)
+	now                 func() time.Time
+}
+
 func PasteText(text string, restoreClipboard bool, targetWindow string) (PasteResult, error) {
+	return pasteTextWithRuntime(text, restoreClipboard, targetWindow, pasteRuntime{
+		captureClipboard: captureClipboard,
+		startClipboardOwner: func(text string) (pasteClipboardOwner, error) {
+			return startClipboardOwner(text)
+		},
+		focusWindow: FocusWindow,
+		releaseModifiers: func() {
+			_ = exec.Command("xdotool", "keyup", "alt", "shift", "super", "ctrl", "Meta_L", "Meta_R").Run()
+		},
+		simulatePaste: func() error {
+			return exec.Command("xdotool", "key", "--clearmodifiers", "ctrl+v").Run()
+		},
+		sleep: time.Sleep,
+		now:   time.Now,
+	})
+}
+
+func pasteTextWithRuntime(text string, restoreClipboard bool, targetWindow string, runtime pasteRuntime) (PasteResult, error) {
 	var snapshot clipboardSnapshot
-	if restoreClipboard {
+	canRestoreClipboard := restoreClipboard
+	var clipboardBackupErr error
+	if canRestoreClipboard {
 		var err error
-		snapshot, err = captureClipboard()
+		snapshot, err = runtime.captureClipboard()
 		if err != nil {
-			return PasteResult{}, fmt.Errorf("back up clipboard: %w", err)
+			// Clipboard preservation is secondary to inserting the recognized
+			// text. Continue with a one-shot replacement and report the lost
+			// restoration capability after Ctrl+V succeeds.
+			clipboardBackupErr = fmt.Errorf("back up clipboard: %w", err)
+			canRestoreClipboard = false
 		}
 	}
 
-	owner, err := startClipboardOwner(text)
+	owner, err := runtime.startClipboardOwner(text)
 	if err != nil {
 		return PasteResult{}, fmt.Errorf("write to clipboard: %w", err)
 	}
 	restoreAfterFailure := func(operationErr error) error {
-		if !restoreClipboard {
+		if !canRestoreClipboard {
+			if clipboardBackupErr != nil {
+				return errors.Join(operationErr, clipboardBackupErr)
+			}
 			return operationErr
 		}
 		if restoreErr := owner.restore(snapshot); restoreErr != nil {
@@ -59,28 +101,30 @@ func PasteText(text string, restoreClipboard bool, targetWindow string) (PasteRe
 
 	// Focus back to the original window
 	if targetWindow != "" {
-		if err := FocusWindow(targetWindow); err != nil {
+		if err := runtime.focusWindow(targetWindow); err != nil {
 			return PasteResult{}, restoreAfterFailure(fmt.Errorf("focus target window: %w", err))
 		}
-		time.Sleep(100 * time.Millisecond)
+		runtime.sleep(100 * time.Millisecond)
 	}
 
 	// Explicitly release all modifier keys to avoid stuck keys
 	// when triggered via keyboard shortcut
-	exec.Command("xdotool", "keyup", "alt", "shift", "super", "ctrl", "Meta_L", "Meta_R").Run()
-	time.Sleep(50 * time.Millisecond)
+	runtime.releaseModifiers()
+	runtime.sleep(50 * time.Millisecond)
 
-	if err := exec.Command("xdotool", "key", "--clearmodifiers", "ctrl+v").Run(); err != nil {
+	if err := runtime.simulatePaste(); err != nil {
 		return PasteResult{}, restoreAfterFailure(fmt.Errorf("simulate paste: %w", err))
 	}
-	result := PasteResult{InsertedAt: time.Now()}
+	result := PasteResult{InsertedAt: runtime.now()}
 
-	if restoreClipboard {
+	if canRestoreClipboard {
 		// Most clients request the data immediately after Ctrl+V. Waiting for an
 		// actual payload request avoids the old fixed 800 ms race; the timeout is
 		// only a fallback for unusual clients that do not request clipboard data.
 		owner.waitUntilServed(clipboardRequestTimeout)
 		result.ClipboardRestoreError = owner.restore(snapshot)
+	} else {
+		result.ClipboardRestoreError = clipboardBackupErr
 	}
 
 	return result, nil

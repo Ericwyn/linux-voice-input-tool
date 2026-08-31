@@ -25,7 +25,10 @@ const (
 	maxDirectPropertyBytes    = 240 << 10
 )
 
-var errClipboardManagerUnavailable = errors.New("X11 clipboard manager unavailable")
+var (
+	errClipboardManagerUnavailable = errors.New("X11 clipboard manager unavailable")
+	errSelectionTargetRefused      = errors.New("selection owner refused the target")
+)
 
 // clipboardPayload is one representation advertised by an X11 selection
 // owner. Type and Format describe the property exactly as the original owner
@@ -250,48 +253,15 @@ func captureClipboardWithConnection(x *xClipboardConnection) (clipboardSnapshot,
 		)
 	}
 
-	snapshot := clipboardSnapshot{HadOwner: true}
-	seen := make(map[xproto.Atom]struct{})
-	totalBytes := 0
 	targets := decodeAtoms(targetList.Data)
 	if len(targets) > maxClipboardTargets {
 		return clipboardSnapshot{}, fmt.Errorf("clipboard advertises too many targets: %d", len(targets))
 	}
-	for _, target := range targets {
-		if target == xproto.AtomNone {
-			continue
-		}
-		if _, duplicate := seen[target]; duplicate {
-			continue
-		}
-		seen[target] = struct{}{}
-
-		name, err := x.atomName(target)
-		if err != nil {
-			return clipboardSnapshot{}, fmt.Errorf("resolve clipboard target %d: %w", target, err)
-		}
-		if !shouldSnapshotTarget(name) {
-			continue
-		}
-
-		remaining := maxClipboardSnapshotBytes - totalBytes
-		payload, err := x.convertSelection(target, remaining)
-		if err != nil {
-			return clipboardSnapshot{}, fmt.Errorf("read clipboard target %s: %w", name, err)
-		}
-		if err := validatePayload(payload); err != nil {
-			return clipboardSnapshot{}, fmt.Errorf("read clipboard target %s: %w", name, err)
-		}
-		totalBytes += len(payload.Data)
-		if totalBytes > maxClipboardSnapshotBytes {
-			return clipboardSnapshot{}, fmt.Errorf(
-				"clipboard snapshot exceeds %d MiB",
-				maxClipboardSnapshotBytes>>20,
-			)
-		}
-		payload.Target = target
-		snapshot.Payloads = append(snapshot.Payloads, payload)
+	payloads, err := captureAdvertisedTargets(targets, x.atomName, x.convertSelection)
+	if err != nil {
+		return clipboardSnapshot{}, err
 	}
+	snapshot := clipboardSnapshot{HadOwner: true, Payloads: payloads}
 
 	ownerReply, err = xproto.GetSelectionOwner(x.conn, x.atoms.clipboard).Reply()
 	if err != nil {
@@ -302,6 +272,66 @@ func captureClipboardWithConnection(x *xClipboardConnection) (clipboardSnapshot,
 	}
 
 	return snapshot, nil
+}
+
+// captureAdvertisedTargets reads the payload-bearing formats returned by
+// TARGETS. X11 owners in the wild occasionally advertise a format and then
+// reject a conversion request for that same format. Such a target contains no
+// retrievable data, so skip it while retaining every representation the owner
+// can actually serve.
+func captureAdvertisedTargets(
+	targets []xproto.Atom,
+	atomName func(xproto.Atom) (string, error),
+	convertSelection func(xproto.Atom, int) (clipboardPayload, error),
+) ([]clipboardPayload, error) {
+	payloads := make([]clipboardPayload, 0, len(targets))
+	seen := make(map[xproto.Atom]struct{})
+	totalBytes := 0
+	refusedTargets := 0
+	for _, target := range targets {
+		if target == xproto.AtomNone {
+			continue
+		}
+		if _, duplicate := seen[target]; duplicate {
+			continue
+		}
+		seen[target] = struct{}{}
+
+		name, err := atomName(target)
+		if err != nil {
+			return nil, fmt.Errorf("resolve clipboard target %d: %w", target, err)
+		}
+		if !shouldSnapshotTarget(name) {
+			continue
+		}
+
+		remaining := maxClipboardSnapshotBytes - totalBytes
+		payload, err := convertSelection(target, remaining)
+		if errors.Is(err, errSelectionTargetRefused) {
+			refusedTargets++
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read clipboard target %s: %w", name, err)
+		}
+		if err := validatePayload(payload); err != nil {
+			return nil, fmt.Errorf("read clipboard target %s: %w", name, err)
+		}
+		totalBytes += len(payload.Data)
+		if totalBytes > maxClipboardSnapshotBytes {
+			return nil, fmt.Errorf(
+				"clipboard snapshot exceeds %d MiB",
+				maxClipboardSnapshotBytes>>20,
+			)
+		}
+		payload.Target = target
+		payloads = append(payloads, payload)
+	}
+
+	if len(payloads) == 0 && refusedTargets > 0 {
+		return nil, errors.New("clipboard owner refused all advertised payload targets")
+	}
+	return payloads, nil
 }
 
 func (x *xClipboardConnection) convertSelection(target xproto.Atom, limit int) (clipboardPayload, error) {
@@ -332,7 +362,7 @@ func (x *xClipboardConnection) convertSelection(target xproto.Atom, limit int) (
 			continue
 		}
 		if notify.Property == xproto.AtomNone {
-			return clipboardPayload{}, errors.New("selection owner refused the target")
+			return clipboardPayload{}, errSelectionTargetRefused
 		}
 		if notify.Property != x.atoms.dataProperty {
 			return clipboardPayload{}, fmt.Errorf("selection owner replied on unexpected property %d", notify.Property)
