@@ -10,10 +10,13 @@ import (
 )
 
 type fakePasteClipboardOwner struct {
-	waitCalls    int
-	restoreCalls int
-	restored     clipboardSnapshot
-	restoreErr   error
+	beginCalls    int
+	waitCalls     int
+	restoreCalls  int
+	serveSequence uint64
+	waitedAfter   uint64
+	restored      clipboardSnapshot
+	restoreErr    error
 }
 
 func (owner *fakePasteClipboardOwner) restore(snapshot clipboardSnapshot) error {
@@ -22,8 +25,14 @@ func (owner *fakePasteClipboardOwner) restore(snapshot clipboardSnapshot) error 
 	return owner.restoreErr
 }
 
-func (owner *fakePasteClipboardOwner) waitUntilServed(time.Duration) {
+func (owner *fakePasteClipboardOwner) beginPaste() uint64 {
+	owner.beginCalls++
+	return owner.serveSequence
+}
+
+func (owner *fakePasteClipboardOwner) waitUntilServedAfter(sequence uint64, _ time.Duration) {
 	owner.waitCalls++
+	owner.waitedAfter = sequence
 }
 
 func TestCaptureAdvertisedTargetsSkipsRefusedFormat(t *testing.T) {
@@ -111,8 +120,8 @@ func TestPasteContinuesWhenClipboardBackupFails(t *testing.T) {
 	if !errors.Is(result.ClipboardRestoreError, backupCause) {
 		t.Fatalf("clipboard warning = %v, want wrapped backup error", result.ClipboardRestoreError)
 	}
-	if owner.waitCalls != 0 || owner.restoreCalls != 0 {
-		t.Fatalf("unavailable backup was used: waits=%d restores=%d", owner.waitCalls, owner.restoreCalls)
+	if owner.beginCalls != 0 || owner.waitCalls != 0 || owner.restoreCalls != 0 {
+		t.Fatalf("unavailable backup was used: begins=%d waits=%d restores=%d", owner.beginCalls, owner.waitCalls, owner.restoreCalls)
 	}
 }
 
@@ -123,7 +132,9 @@ func TestPasteRestoresSuccessfulClipboardBackup(t *testing.T) {
 		Format: 8,
 		Data:   []byte("original"),
 	}}}
-	owner := &fakePasteClipboardOwner{}
+	// Model a clipboard history tool that already fetched the recognized text
+	// before Ctrl+V. The paste must wait for a request after this sequence.
+	owner := &fakePasteClipboardOwner{serveSequence: 1}
 
 	result, err := pasteTextWithRuntime("识别结果", true, "42", pasteRuntime{
 		captureClipboard: func() (clipboardSnapshot, error) { return snapshot, nil },
@@ -132,15 +143,24 @@ func TestPasteRestoresSuccessfulClipboardBackup(t *testing.T) {
 		},
 		focusWindow:      func(string) error { return nil },
 		releaseModifiers: func() {},
-		simulatePaste:    func() error { return nil },
-		sleep:            func(time.Duration) {},
-		now:              time.Now,
+		simulatePaste: func() error {
+			if owner.beginCalls != 1 {
+				t.Fatalf("paste began before clipboard request marker was captured")
+			}
+			owner.serveSequence++
+			return nil
+		},
+		sleep: func(time.Duration) {},
+		now:   time.Now,
 	})
 	if err != nil || result.ClipboardRestoreError != nil {
 		t.Fatalf("paste result = %#v, error = %v", result, err)
 	}
-	if owner.waitCalls != 1 || owner.restoreCalls != 1 {
-		t.Fatalf("clipboard restore calls = waits:%d restores:%d", owner.waitCalls, owner.restoreCalls)
+	if owner.beginCalls != 1 || owner.waitCalls != 1 || owner.restoreCalls != 1 {
+		t.Fatalf("clipboard restore calls = begins:%d waits:%d restores:%d", owner.beginCalls, owner.waitCalls, owner.restoreCalls)
+	}
+	if owner.waitedAfter != 1 {
+		t.Fatalf("waited after sequence %d, want pre-paste sequence 1", owner.waitedAfter)
 	}
 	if len(owner.restored.Payloads) != 1 || string(owner.restored.Payloads[0].Data) != "original" {
 		t.Fatalf("restored snapshot = %#v", owner.restored)

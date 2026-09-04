@@ -3,7 +3,7 @@
 package version
 
 // Version is the current application version, following semantic versioning.
-const Version = "0.7.0"
+const Version = "0.8.0"
 
 // Name is the human-facing application name used in help and window titles.
 const Name = "Linux Voice Input"

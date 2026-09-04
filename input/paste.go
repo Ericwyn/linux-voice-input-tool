@@ -35,7 +35,8 @@ type PasteResult struct {
 
 type pasteClipboardOwner interface {
 	restore(clipboardSnapshot) error
-	waitUntilServed(time.Duration)
+	beginPaste() uint64
+	waitUntilServedAfter(uint64, time.Duration)
 }
 
 type pasteRuntime struct {
@@ -112,16 +113,24 @@ func pasteTextWithRuntime(text string, restoreClipboard bool, targetWindow strin
 	runtime.releaseModifiers()
 	runtime.sleep(50 * time.Millisecond)
 
+	var clipboardServeSequence uint64
+	if canRestoreClipboard {
+		// Clipboard managers and history tools commonly read a new selection as
+		// soon as it is published. Only a payload request observed from this point
+		// onward can confirm that the Ctrl+V below has consumed our text.
+		clipboardServeSequence = owner.beginPaste()
+	}
+
 	if err := runtime.simulatePaste(); err != nil {
 		return PasteResult{}, restoreAfterFailure(fmt.Errorf("simulate paste: %w", err))
 	}
 	result := PasteResult{InsertedAt: runtime.now()}
 
 	if canRestoreClipboard {
-		// Most clients request the data immediately after Ctrl+V. Waiting for an
-		// actual payload request avoids the old fixed 800 ms race; the timeout is
-		// only a fallback for unusual clients that do not request clipboard data.
-		owner.waitUntilServed(clipboardRequestTimeout)
+		// Most clients request the data immediately after Ctrl+V. Wait for a
+		// request newer than the marker above so an eager clipboard manager cannot
+		// make us restore the previous clipboard before the target reads the text.
+		owner.waitUntilServedAfter(clipboardServeSequence, clipboardRequestTimeout)
 		result.ClipboardRestoreError = owner.restore(snapshot)
 	} else {
 		result.ClipboardRestoreError = clipboardBackupErr

@@ -68,6 +68,39 @@ func TestEncodeDecodeAtoms(t *testing.T) {
 	}
 }
 
+func TestClipboardOwnerWaitsForRequestAfterPasteBegins(t *testing.T) {
+	owner := &clipboardOwner{
+		served: make(chan struct{}),
+		lost:   make(chan struct{}),
+		done:   make(chan struct{}),
+	}
+
+	// Simulate a clipboard manager eagerly reading the newly published text.
+	owner.markServed()
+	sequence := owner.beginPaste()
+
+	waitDone := make(chan struct{})
+	go func() {
+		owner.waitUntilServedAfter(sequence, time.Second)
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		t.Fatal("a request before the paste incorrectly satisfied the wait")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// The target application's request happens after Ctrl+V and releases the
+	// waiter so the original clipboard can now be restored safely.
+	owner.markServed()
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("a request after the paste did not satisfy the wait")
+	}
+}
+
 // This integration test uses a private X11 selection atom, never CLIPBOARD, so
 // it cannot disturb the user's real clipboard. It is skipped on headless test
 // runners and exercises both direct text transfer and INCR image transfer when

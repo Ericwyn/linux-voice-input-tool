@@ -552,11 +552,11 @@ type clipboardOwner struct {
 	transfers map[incrementalTransferKey]*incrementalTransfer
 	persistCh chan struct{}
 
-	served     chan struct{}
-	lost       chan struct{}
-	done       chan struct{}
-	servedOnce sync.Once
-	lostOnce   sync.Once
+	served         chan struct{}
+	servedSequence uint64
+	lost           chan struct{}
+	done           chan struct{}
+	lostOnce       sync.Once
 }
 
 var activeClipboardOwner struct {
@@ -766,8 +766,16 @@ func (o *clipboardOwner) handleSelectionRequest(request xproto.SelectionRequestE
 		Property:  property,
 	}
 	if err := xproto.SendEventChecked(o.conn, false, request.Requestor, 0, string(notify.Bytes())).Check(); err == nil && property != xproto.AtomNone && servedData {
-		o.servedOnce.Do(func() { close(o.served) })
+		o.markServed()
 	}
+}
+
+func (o *clipboardOwner) markServed() {
+	o.mu.Lock()
+	o.servedSequence++
+	close(o.served)
+	o.served = make(chan struct{})
+	o.mu.Unlock()
 }
 
 func (o *clipboardOwner) writeTarget(requestor xproto.Window, property, target xproto.Atom) (bool, bool, error) {
@@ -961,14 +969,37 @@ func (o *clipboardOwner) restore(snapshot clipboardSnapshot) error {
 	return nil
 }
 
-func (o *clipboardOwner) waitUntilServed(timeout time.Duration) {
+// beginPaste returns a marker that distinguishes clipboard reads caused by the
+// upcoming paste from eager reads made after the selection was first published.
+func (o *clipboardOwner) beginPaste() uint64 {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.servedSequence
+}
+
+func (o *clipboardOwner) waitUntilServedAfter(sequence uint64, timeout time.Duration) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case <-o.served:
-	case <-o.lost:
-	case <-o.done:
-	case <-timer.C:
+	for {
+		o.mu.RLock()
+		if o.servedSequence != sequence {
+			o.mu.RUnlock()
+			return
+		}
+		served := o.served
+		o.mu.RUnlock()
+
+		select {
+		case <-served:
+			// Recheck the sequence under the lock. markServed replaces the
+			// channel for each successful payload request.
+		case <-o.lost:
+			return
+		case <-o.done:
+			return
+		case <-timer.C:
+			return
+		}
 	}
 }
 
