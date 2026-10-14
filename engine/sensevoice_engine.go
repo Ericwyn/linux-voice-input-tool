@@ -75,10 +75,13 @@ func (e *senseVoiceEngine) NewSession() (Session, error) {
 	}
 
 	previewInterval := time.Duration(e.cfg.SenseVoice.PreviewIntervalMs) * time.Millisecond
+	previewMaxInterval := time.Duration(e.cfg.SenseVoice.PreviewMaxIntervalMs) * time.Millisecond
 	session := &senseVoiceSession{
-		recognizer:      recognizer,
-		ownedRecognizer: ownedRecognizer,
-		previewInterval: previewInterval,
+		recognizer:         recognizer,
+		ownedRecognizer:    ownedRecognizer,
+		previewInterval:    previewInterval,
+		previewMaxInterval: previewMaxInterval,
+		previewBackoff:     e.cfg.SenseVoice.PreviewBackoffFactor,
 	}
 	session.start()
 	return session, nil
@@ -107,16 +110,17 @@ type senseVoiceSession struct {
 	// ownedRecognizer is non-nil only in one-shot mode, where this session built
 	// its own recognizer and must close it.
 	ownedRecognizer *api.SenseVoiceRecognizer
+	// previewInterval is the base/floor cadence between preview re-runs.
 	previewInterval time.Duration
+	// previewMaxInterval caps the adaptive cadence; <= 0 means no ceiling.
+	previewMaxInterval time.Duration
+	// previewBackoff multiplies the last re-run's duration to decide the idle
+	// gap before the next one; <= 0 falls back to 1.0.
+	previewBackoff float64
 
 	mu      sync.Mutex
 	buffer  []float32 // audio accumulated so far (appended by FeedAudio)
 	preview string    // most recent preview text, read cheaply by PartialText
-	// inflight guards against preview re-runs piling up: if one re-run is still
-	// running when the next tick fires, that tick is skipped (drop-frame). This
-	// keeps long recordings, where a single full re-run can exceed the interval,
-	// from queuing work indefinitely.
-	inflight bool
 
 	stopCh chan struct{}
 	doneCh chan struct{}
@@ -153,51 +157,78 @@ func (s *senseVoiceSession) PartialText() string {
 	return s.preview
 }
 
-// previewLoop periodically snapshots the accumulated audio and re-recognizes it,
-// caching the result for PartialText. It exits when stopCh is closed.
+// previewLoop snapshots the accumulated audio, re-recognizes it, and caches the
+// result for PartialText, then schedules the next re-run adaptively. Because
+// SenseVoice is non-streaming, each re-run processes the whole accumulated
+// buffer, so its cost grows with recording length. Rather than firing on a
+// fixed interval (which, once a single re-run exceeds the interval, would run
+// re-runs back-to-back and peg the CPU), the loop waits after each re-run in
+// proportion to how long that re-run took. This keeps the CPU duty cycle
+// bounded (~50% at backoff 1.0) so the rest of the system stays responsive on
+// long recordings. The loop exits when stopCh is closed.
 func (s *senseVoiceSession) previewLoop() {
 	defer close(s.doneCh)
 
-	ticker := time.NewTicker(s.previewInterval)
-	defer ticker.Stop()
+	// First re-run uses the base interval; subsequent delays adapt to measured
+	// re-run durations.
+	timer := time.NewTimer(s.previewInterval)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-s.stopCh:
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			s.mu.Lock()
-			if s.inflight {
-				// Previous re-run still going; skip this tick (drop-frame).
-				s.mu.Unlock()
-				continue
-			}
 			if len(s.buffer) == 0 {
+				// Nothing recorded yet; re-check after the base interval.
 				s.mu.Unlock()
+				timer.Reset(s.previewInterval)
 				continue
 			}
 			snapshot := make([]float32, len(s.buffer))
 			copy(snapshot, s.buffer)
-			s.inflight = true
 			s.mu.Unlock()
 
 			start := time.Now()
 			text, err := s.recognizer.Transcribe(snapshot)
+			elapsed := time.Since(start)
 
-			s.mu.Lock()
-			s.inflight = false
 			if err == nil && text != "" {
+				s.mu.Lock()
 				s.preview = text
+				s.mu.Unlock()
 			}
-			s.mu.Unlock()
 
 			if err != nil {
 				log.Printf("SenseVoice preview error: %v", err)
 			} else {
-				log.Printf("SenseVoice preview in %dms: %s", time.Since(start).Milliseconds(), text)
+				log.Printf("SenseVoice preview in %dms: %s", elapsed.Milliseconds(), text)
 			}
+
+			timer.Reset(s.nextPreviewDelay(elapsed))
 		}
 	}
+}
+
+// nextPreviewDelay computes how long to idle before the next preview re-run,
+// based on how long the last re-run took. The gap is lastRun * backoff, floored
+// at previewInterval and capped at previewMaxInterval. This leaves the CPU idle
+// for roughly as long as the re-run was busy, so a lengthening re-run on a long
+// recording stretches the cadence instead of saturating the core.
+func (s *senseVoiceSession) nextPreviewDelay(lastRun time.Duration) time.Duration {
+	backoff := s.previewBackoff
+	if backoff <= 0 {
+		backoff = 1.0
+	}
+	delay := time.Duration(float64(lastRun) * backoff)
+	if delay < s.previewInterval {
+		delay = s.previewInterval
+	}
+	if s.previewMaxInterval > 0 && delay > s.previewMaxInterval {
+		delay = s.previewMaxInterval
+	}
+	return delay
 }
 
 // Finish stops the preview loop, waits for any in-flight re-run to finish, then

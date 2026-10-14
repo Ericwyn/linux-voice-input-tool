@@ -65,11 +65,27 @@ type SenseVoiceConfig struct {
 	UseITN     bool `yaml:"use_itn"`
 	NumThreads int  `yaml:"num_threads"`
 
-	// PreviewIntervalMs is the period, in milliseconds, at which the accumulated
-	// audio is re-recognized to produce a live preview. A value > 0 enables the
-	// pseudo-streaming preview; <= 0 disables it (recognition then runs only
-	// once when recording stops).
+	// PreviewIntervalMs is the base period, in milliseconds, at which the
+	// accumulated audio is re-recognized to produce a live preview. A value > 0
+	// enables the pseudo-streaming preview; <= 0 disables it (recognition then
+	// runs only once when recording stops). It is the floor of the adaptive
+	// schedule: short recordings re-run at this cadence.
 	PreviewIntervalMs int `yaml:"preview_interval_ms"`
+
+	// PreviewMaxIntervalMs caps the adaptive preview cadence. Because SenseVoice
+	// is non-streaming, each preview re-recognizes the whole accumulated buffer,
+	// so a single re-run grows with recording length. To stop long recordings
+	// from monopolizing the CPU, the next re-run is delayed in proportion to how
+	// long the last one took (see PreviewBackoffFactor), but never beyond this
+	// ceiling. <= 0 disables the ceiling.
+	PreviewMaxIntervalMs int `yaml:"preview_max_interval_ms"`
+
+	// PreviewBackoffFactor sets how much idle time to leave between preview
+	// re-runs, as a multiple of the last re-run's duration: the wait before the
+	// next re-run is lastRun * factor (floored at PreviewIntervalMs, capped at
+	// PreviewMaxIntervalMs). A factor of 1.0 keeps the CPU duty cycle around 50%
+	// for long recordings. <= 0 falls back to 1.0.
+	PreviewBackoffFactor float64 `yaml:"preview_backoff_factor"`
 }
 
 // CorrectionsConfig configures the engine-agnostic final-text correction
@@ -200,13 +216,15 @@ func DefaultConfig() *Config {
 			PunctModel:              paths.PunctModel,
 		},
 		SenseVoice: SenseVoiceConfig{
-			ModelDir:          baseDir,
-			Model:             sensePaths.Model,
-			Tokens:            sensePaths.Tokens,
-			Language:          "auto",
-			UseITN:            true,
-			NumThreads:        4,
-			PreviewIntervalMs: 1000,
+			ModelDir:             baseDir,
+			Model:                sensePaths.Model,
+			Tokens:               sensePaths.Tokens,
+			Language:             "auto",
+			UseITN:               true,
+			NumThreads:           4,
+			PreviewIntervalMs:    1000,
+			PreviewMaxIntervalMs: 5000,
+			PreviewBackoffFactor: 1.0,
 		},
 		Audio: AudioConfig{
 			SampleRate: 16000,

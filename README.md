@@ -383,7 +383,9 @@ sensevoice:
   language: auto            # auto / zh / en / yue / ja / ko
   use_itn: true             # 开启逆文本正则化（含标点）
   num_threads: 4
-  preview_interval_ms: 1000 # 实时预览重跑间隔（毫秒）；填 0 关闭预览
+  preview_interval_ms: 1000      # 实时预览基准重跑间隔（毫秒）；填 0 关闭预览
+  preview_max_interval_ms: 5000  # 自适应退避时的间隔上限（毫秒）；填 0 不封顶
+  preview_backoff_factor: 1.0    # 下次重跑前的空闲时间 = 上次耗时 × 该系数
 
 audio:
   sample_rate: 16000
@@ -438,7 +440,9 @@ whisper:
 | `sensevoice.language` | 识别语种：`auto` / `zh` / `en` / `yue` / `ja` / `ko` |
 | `sensevoice.use_itn` | 是否开启逆文本正则化（含标点），默认 `true` |
 | `sensevoice.num_threads` | 推理线程数，默认 4 |
-| `sensevoice.preview_interval_ms` | 实时预览重跑间隔（毫秒）；`> 0` 开启，`0` 或负数关闭 |
+| `sensevoice.preview_interval_ms` | 实时预览基准重跑间隔（毫秒），也是自适应退避的下限；`> 0` 开启，`0` 或负数关闭 |
+| `sensevoice.preview_max_interval_ms` | 自适应退避的间隔上限（毫秒），默认 5000；`0` 或负数表示不封顶 |
+| `sensevoice.preview_backoff_factor` | 下次预览重跑前的空闲时间 = 上次耗时 × 该系数，默认 `1.0`（CPU 占空比约 50%）；`<= 0` 回退为 1.0 |
 | `sherpa.model_dir` | sherpa 三模型所在目录（各模型路径由它自动推导） |
 | `sherpa.num_threads` | 推理线程数，默认 4 |
 | `sherpa.rule1_min_trailing_silence` | 较长静音断句阈值（秒），默认 2.4 |
