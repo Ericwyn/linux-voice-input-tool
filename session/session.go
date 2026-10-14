@@ -8,8 +8,10 @@ package session
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"linux-voice-input/audio"
 	"linux-voice-input/config"
@@ -559,11 +561,33 @@ func (c *Controller) transcribe(recorder *audio.Recorder, activeSession engine.S
 	}
 
 	correction := c.applyCorrections(text)
+
+	finalText := correction.Text
+	c.mu.Lock()
+	removeTrailing := c.cfg.RemoveTrailingSymbols
+	c.mu.Unlock()
+	if removeTrailing {
+		finalText = stripTrailingSymbols(finalText)
+	}
+
 	return transcriptionResult{
 		RawText:           text,
-		Text:              correction.Text,
+		Text:              finalText,
 		AppliedStrategies: correction.Applied,
 	}
+}
+
+// stripTrailingSymbols removes any trailing punctuation, symbols and whitespace
+// from the recognized text. Speech recognition (notably the SenseVoice ITN
+// pass) tends to append a sentence-ending period even when the user has not
+// finished speaking, so trimming the tail lets the user add their own
+// punctuation and spacing. A rune is kept only when it is a letter or a number,
+// which preserves CJK characters, Latin words and digits while dropping any
+// trailing marks regardless of language.
+func stripTrailingSymbols(text string) string {
+	return strings.TrimRightFunc(text, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	})
 }
 
 // applyCorrections runs the engine-agnostic final-text service with a bounded

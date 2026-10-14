@@ -150,6 +150,12 @@ type Config struct {
 	Corrections      CorrectionsConfig   `yaml:"corrections"`
 	Statistics       StatisticsConfig    `yaml:"statistics"`
 	RestoreClipboard bool                `yaml:"restore_clipboard"`
+	// RemoveTrailingSymbols strips any trailing punctuation and whitespace from
+	// the final recognized text before pasting. Speech recognition (and the
+	// SenseVoice ITN pass in particular) tends to append a sentence-ending
+	// period even when the user has not finished a thought, so trimming it lets
+	// the user add their own punctuation and spacing. On by default.
+	RemoveTrailingSymbols bool `yaml:"remove_trailing_symbols"`
 	// Hotkey is the global hotkey combination that toggles recording,
 	// e.g. "alt+shift+g". Modifiers: ctrl/alt/shift/super.
 	Hotkey string `yaml:"hotkey"`
@@ -234,8 +240,9 @@ func DefaultConfig() *Config {
 			EmptyResult:       true,
 			PasteFailed:       true,
 		},
-		RestoreClipboard: true,
-		Hotkey:           "alt+shift+g",
+		RestoreClipboard:      true,
+		RemoveTrailingSymbols: true,
+		Hotkey:                "alt+shift+g",
 		HotkeyEnabled:    true,
 	}
 }

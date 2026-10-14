@@ -403,6 +403,7 @@ statistics:
 hotkey: alt+shift+g
 hotkey_enabled: true
 restore_clipboard: true
+remove_trailing_symbols: true       # 去掉识别结果末尾的标点与空格，默认开启
 ```
 
 ### 切换到 sherpa
@@ -460,6 +461,7 @@ whisper:
 | `corrections.dict_path` | 最后执行的用户词典路径；留空则用 `~/.linux-voice-input/corrections.txt` |
 | `statistics.enabled` | 是否记录成功语音输入的匿名日汇总，默认 `false`；关闭只暂停新增，历史数据保留 |
 | `restore_clipboard` | 粘贴后是否尽量恢复原剪贴板内容；旧剪贴板无法完整读取时仍会优先输入识别文字 |
+| `remove_trailing_symbols` | 是否去掉识别结果末尾的标点、符号与空格（不影响句中标点），默认 `true`；需要末尾符号或空格时请自行补充 |
 
 > **旧配置自动迁移**：如果你的 `config.yaml` 还是旧的 `api:` 块格式（`api.engine` / `api.key` 等），程序会在加载时自动迁移到新的 `engine` + `whisper` 布局并回写，无需手动改动。
 
