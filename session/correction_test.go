@@ -52,8 +52,9 @@ func TestControllerCorrectionFailureKeepsText(t *testing.T) {
 	}
 }
 
-func TestControllerSetCorrectionsEnabledDoesNotReplaceEngine(t *testing.T) {
+func TestControllerSetCorrectionModeDoesNotReplaceEngine(t *testing.T) {
 	cfg := config.DefaultConfig()
+	cfg.CorrectionMode = config.CorrectionModeOff
 	service := corrector.NewService(false, &sessionTestStrategy{
 		name:  "model",
 		apply: func(text string) (string, error) { return text, nil },
@@ -61,12 +62,12 @@ func TestControllerSetCorrectionsEnabledDoesNotReplaceEngine(t *testing.T) {
 	controller := &Controller{cfg: cfg, correctionService: service}
 	originalEngine := controller.engine
 
-	controller.SetCorrectionsEnabled(true)
+	controller.SetCorrectionMode(config.CorrectionModeLocal)
 
-	if !controller.CorrectionsEnabled() || !cfg.Corrections.Enabled || !service.Enabled() {
-		t.Fatal("corrections were not enabled consistently")
+	if !controller.LocalCorrectionEnabled() || !cfg.UseLocalCorrection() || !service.Enabled() {
+		t.Fatal("local correction was not enabled consistently")
 	}
 	if controller.engine != originalEngine {
-		t.Fatal("toggling corrections replaced the ASR engine")
+		t.Fatal("switching correction mode replaced the ASR engine")
 	}
 }

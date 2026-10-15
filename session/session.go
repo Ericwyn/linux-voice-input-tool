@@ -69,6 +69,11 @@ type Controller struct {
 	// correctionService owns the optional neural model and final user
 	// dictionary. It is engine-agnostic and runs exactly once after Finish.
 	correctionService *corrector.Service
+	// llmService owns the optional LLM-based correction. It is a separate
+	// Service from correctionService so the two passes have independent enabled
+	// state and independent timeouts, driven by the single-select correction
+	// mode. It is empty/inert when the LLM config is incomplete.
+	llmService *corrector.Service
 	// statistics owns the opt-in asynchronous daily-file writer. pasteText is a
 	// narrow dependency seam that keeps the success-only recording boundary
 	// testable without invoking the X11 clipboard/xdotool integration.
@@ -118,6 +123,7 @@ func New(cfg *config.Config) *Controller {
 	}
 	c.engine = eng
 	c.correctionService = newCorrectionService(cfg)
+	c.llmService = corrector.NewLLMServiceFromConfig(cfg)
 	return c
 }
 
@@ -132,30 +138,54 @@ func newCorrectionService(cfg *config.Config) *corrector.Service {
 		fallback.Corrections.Strategy = ""
 		service, _ = corrector.NewServiceFromConfig(&fallback)
 	}
-	if cfg.Corrections.Enabled {
-		log.Printf("Text corrections enabled: strategy=%q dictionary=%s",
+	if cfg.UseLocalCorrection() {
+		log.Printf("Local text corrections enabled: strategy=%q dictionary=%s",
 			cfg.Corrections.Strategy, cfg.CorrectionsDictPath())
 	}
 	return service
 }
 
-// CorrectionsEnabled reports the live service state.
-func (c *Controller) CorrectionsEnabled() bool {
+// CorrectionMode returns the live correction mode (off/local/llm/combined).
+func (c *Controller) CorrectionMode() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cfg.CorrectionMode
+}
+
+// LocalCorrectionEnabled reports whether the local pass is currently active.
+func (c *Controller) LocalCorrectionEnabled() bool {
 	c.mu.Lock()
 	service := c.correctionService
 	c.mu.Unlock()
 	return service != nil && service.Enabled()
 }
 
-// SetCorrectionsEnabled changes only the post-processing service. It does not
-// rebuild or reload the ASR engine, so it is safe for the tray checkbox.
-func (c *Controller) SetCorrectionsEnabled(enabled bool) {
+// LLMCorrectionEnabled reports whether the LLM pass is currently active.
+func (c *Controller) LLMCorrectionEnabled() bool {
 	c.mu.Lock()
-	c.cfg.Corrections.Enabled = enabled
-	service := c.correctionService
+	service := c.llmService
 	c.mu.Unlock()
-	if service != nil {
-		service.SetEnabled(enabled)
+	return service != nil && service.Enabled()
+}
+
+// SetCorrectionMode switches the correction pipeline. It updates the config
+// mode and flips each service's enabled state accordingly, without rebuilding
+// or reloading the ASR engine, so it is safe to call from the tray. The LLM
+// service only actually calls out when its config is complete (an incomplete
+// config leaves it an empty, inert service regardless of mode).
+func (c *Controller) SetCorrectionMode(mode string) {
+	c.mu.Lock()
+	c.cfg.CorrectionMode = mode
+	local := c.correctionService
+	llm := c.llmService
+	useLocal := c.cfg.UseLocalCorrection()
+	useLLM := c.cfg.UseLLMCorrection()
+	c.mu.Unlock()
+	if local != nil {
+		local.SetEnabled(useLocal)
+	}
+	if llm != nil {
+		llm.SetEnabled(useLLM)
 	}
 }
 
@@ -561,8 +591,15 @@ func (c *Controller) transcribe(recorder *audio.Recorder, activeSession engine.S
 	}
 
 	correction := c.applyCorrections(text)
+	// LLM pass runs after the local pass (combined mode) or on its own; it is a
+	// no-op when the LLM service is disabled or inert.
+	corrected := c.applyLLMCorrection(correction.Text)
 
-	finalText := correction.Text
+	// Trailing-symbol trimming is intentionally the very last step: whatever the
+	// local or LLM passes produced (an LLM in particular tends to re-add a full
+	// sentence-ending period), the user's "remove trailing symbols" preference
+	// has the final say.
+	finalText := corrected
 	c.mu.Lock()
 	removeTrailing := c.cfg.RemoveTrailingSymbols
 	c.mu.Unlock()
@@ -620,6 +657,45 @@ func (c *Controller) applyCorrections(text string) corrector.Result {
 	return result
 }
 
+// applyLLMCorrection runs the independent LLM correction service with its own
+// hard timeout. Unlike the local ONNX path, an HTTP request is genuinely
+// cancellable, so the timeout bounds real end-to-end latency. Any failure or
+// timeout falls open to the input text (the strategy returns an error, which
+// corrector.Service turns into "keep previous text"), so the user never loses
+// the recognized result to a flaky network.
+func (c *Controller) applyLLMCorrection(text string) string {
+	c.mu.Lock()
+	service := c.llmService
+	timeout := c.cfg.LLMCorrectionTimeout()
+	model := c.cfg.LLMCorrection.Model
+	c.mu.Unlock()
+	if service == nil || !service.Enabled() || text == "" {
+		return text
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Start marker: pairs with the completion line below so a request that hangs
+	// until the timeout is still visible in the log.
+	log.Printf("LLM correction: calling model %q (timeout %dms)", model, timeout.Milliseconds())
+	result := service.Correct(ctx, text)
+	ms := result.Duration.Milliseconds()
+
+	if len(result.Failures) > 0 {
+		for _, failure := range result.Failures {
+			log.Printf("LLM correction failed in %dms (fail-open, model %q): %v", ms, model, failure.Err)
+		}
+		return result.Text
+	}
+	if result.Text != text {
+		log.Printf("LLM corrected in %dms (model %q): %s -> %s", ms, model, text, result.Text)
+	} else {
+		log.Printf("LLM correction in %dms (model %q): no change", ms, model)
+	}
+	return result.Text
+}
+
 // Reload swaps the configuration and rebuilds the engine if needed. It is
 // intended to be called from the settings window after saving. It is a no-op
 // to reload while a recording is in progress (only the config pointer is
@@ -654,6 +730,13 @@ func (c *Controller) Reload(cfg *config.Config) error {
 	}
 	c.correctionService = newCorrectionService(cfg)
 
+	// Rebuild the LLM pipeline too, so endpoint/key/model/prompt/mode edits take
+	// effect. An incomplete LLM config yields an empty, inert service.
+	if c.llmService != nil {
+		_ = c.llmService.Close()
+	}
+	c.llmService = corrector.NewLLMServiceFromConfig(cfg)
+
 	eng, err := engine.New(cfg)
 	if err != nil {
 		log.Printf("Engine init failed on reload: %v", err)
@@ -687,6 +770,10 @@ func (c *Controller) Close() {
 	if c.correctionService != nil {
 		_ = c.correctionService.Close()
 		c.correctionService = nil
+	}
+	if c.llmService != nil {
+		_ = c.llmService.Close()
+		c.llmService = nil
 	}
 	if c.statistics != nil {
 		if err := c.statistics.Close(); err != nil {

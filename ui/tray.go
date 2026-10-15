@@ -14,9 +14,10 @@ import (
 //	状态: 空闲                 (disabled when idle; clickable to cancel while recording)
 //	---
 //	启用热键监听               (checkbox)
-//	启用语音纠错               (checkbox)
 //	启用语音统计               (checkbox)
 //	查看语音统计
+//	---
+//	纠错: 关闭|本地|LLM|本地+LLM  (checkboxes; single-select, only the active mode checked)
 //	---
 //	sensevoice|sherpa|whisper   (checkboxes; only the active engine is checked)
 //	---
@@ -46,13 +47,23 @@ func (a *App) setupTray() {
 	a.hotkeyItem = menu.AddCheckbox("启用热键监听", a.HotkeyEnabled(), func() {
 		a.toggleHotkey()
 	})
-	a.correctionsItem = menu.AddCheckbox("启用语音纠错", a.CorrectionsEnabled(), func() {
-		a.toggleCorrections()
-	})
 	a.statisticsItem = menu.AddCheckbox("启用语音统计", a.StatisticsEnabled(), func() {
 		a.toggleStatistics()
 	})
 	menu.Add("查看语音统计", func() { a.showStatistics() })
+
+	menu.AddSeparator()
+
+	// Correction mode single-select group (off / local / llm / combined),
+	// styled like the engine group: only the active mode is checked.
+	selectedMode := a.CorrectionMode()
+	for _, m := range correctionModes {
+		mode := m.Mode
+		item := menu.AddCheckbox(m.Label, mode == selectedMode, func() {
+			a.selectCorrectionMode(mode)
+		})
+		a.correctionModeItems[mode] = item
+	}
 
 	menu.AddSeparator()
 

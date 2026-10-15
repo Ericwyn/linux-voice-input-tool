@@ -30,6 +30,16 @@ import (
 // engineNames is the fixed set of selectable engines, in tray display order.
 var engineNames = []string{"sensevoice", "sherpa", "whisper"}
 
+// correctionModes is the fixed set of correction pipelines shown as a single-
+// select group in the tray, in display order. The labels share the "纠错: " prefix
+// so the group reads as one logical selector.
+var correctionModes = []struct{ Mode, Label string }{
+	{config.CorrectionModeOff, "纠错: 关闭"},
+	{config.CorrectionModeLocal, "纠错: 本地"},
+	{config.CorrectionModeLLM, "纠错: LLM"},
+	{config.CorrectionModeCombined, "纠错: 本地+LLM"},
+}
+
 // App wires together the system tray, global hotkey handler, and the shared
 // session controller.
 type App struct {
@@ -44,13 +54,13 @@ type App struct {
 
 	// tray and the menu-item handles are created in setupTray and updated live
 	// from menu callbacks and the recording state-change callback.
-	tray            *systray.SystemTray
-	statusItem      *systray.MenuItem
-	hotkeyItem      *systray.MenuItem
-	correctionsItem *systray.MenuItem
-	statisticsItem  *systray.MenuItem
-	engineItems     map[string]*systray.MenuItem
-	downloadItem    *systray.MenuItem
+	tray                *systray.SystemTray
+	statusItem          *systray.MenuItem
+	hotkeyItem          *systray.MenuItem
+	correctionModeItems map[string]*systray.MenuItem
+	statisticsItem      *systray.MenuItem
+	engineItems         map[string]*systray.MenuItem
+	downloadItem        *systray.MenuItem
 
 	// downloadMu guards downloadCancel, which is non-nil exactly while a model
 	// download is in flight. Cancelling it aborts the transfer; the download
@@ -66,10 +76,11 @@ type App struct {
 // the notification "取消" action so clicking it cancels the active recording.
 func NewApp(cfg *config.Config, controller *session.Controller) *App {
 	app := &App{
-		controller:  controller,
-		cfg:         cfg,
-		saveConfig:  config.Save,
-		engineItems: make(map[string]*systray.MenuItem),
+		controller:          controller,
+		cfg:                 cfg,
+		saveConfig:          config.Save,
+		engineItems:         make(map[string]*systray.MenuItem),
+		correctionModeItems: make(map[string]*systray.MenuItem),
 	}
 
 	app.initHotkey()
@@ -164,63 +175,106 @@ func (a *App) toggleHotkey() {
 	}
 }
 
-// CorrectionsEnabled reports whether final-text correction is enabled in the
-// live UI configuration.
-func (a *App) CorrectionsEnabled() bool {
+// CorrectionMode returns the live correction mode in the UI configuration.
+func (a *App) CorrectionMode() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.cfg.Corrections.Enabled
+	return config.NormalizeCorrectionMode(a.cfg.CorrectionMode)
 }
 
-// toggleCorrections flips the post-recognition correction service, persists
-// the setting, and updates the tray checkbox. Unlike an engine switch it never
-// reloads SenseVoice; the selected correction model initializes lazily on the
-// next final transcription.
-func (a *App) toggleCorrections() {
-	a.mu.Lock()
-	enabled := !a.cfg.Corrections.Enabled
-	a.cfg.Corrections.Enabled = enabled
-	cfgCopy := *a.cfg
-	saveConfig := a.saveConfig
-	a.mu.Unlock()
+// selectCorrectionMode switches the correction pipeline from the tray single-
+// select group. Switching to a mode that uses the LLM (llm or combined) first
+// validates the LLM config; if it is incomplete the previous mode is kept, the
+// change is not persisted, and a notification lists the missing fields. This
+// mirrors the engine-switch + model-check pattern and never reloads the ASR
+// engine. It runs on its own goroutine so saving/notifying does not block the
+// D-Bus menu callback.
+func (a *App) selectCorrectionMode(mode string) {
+	go func() {
+		a.mu.Lock()
+		prev := config.NormalizeCorrectionMode(a.cfg.CorrectionMode)
+		if mode == prev {
+			a.mu.Unlock()
+			a.refreshCorrectionModeItems(prev)
+			return
+		}
+		needsLLM := mode == config.CorrectionModeLLM || mode == config.CorrectionModeCombined
+		if needsLLM {
+			if ok, missing := a.cfg.LLMCorrectionComplete(); !ok {
+				a.mu.Unlock()
+				// Keep the previous selection: do not switch, do not persist.
+				a.refreshCorrectionModeItems(prev)
+				notify.NotifyAux("语音纠错",
+					"LLM 配置不完整，缺少: "+strings.Join(missing, ", ")+"；请在配置文件补全后点托盘“重载配置”", true)
+				return
+			}
+		}
+		a.cfg.CorrectionMode = mode
+		cfgCopy := *a.cfg
+		saveConfig := a.saveConfig
+		a.mu.Unlock()
 
-	a.controller.SetCorrectionsEnabled(enabled)
-	if saveConfig == nil {
-		saveConfig = config.Save
-	}
-	if err := saveConfig(&cfgCopy); err != nil {
-		log.Printf("Save correction toggle failed: %v", err)
-	}
-	if a.correctionsItem != nil {
-		a.correctionsItem.SetChecked(enabled)
-	}
-	if a.tray != nil {
-		a.notifyCorrectionToggle(enabled, &cfgCopy)
-	}
-	log.Printf("Text corrections enabled=%v", enabled)
+		a.controller.SetCorrectionMode(mode)
+		if saveConfig == nil {
+			saveConfig = config.Save
+		}
+		if err := saveConfig(&cfgCopy); err != nil {
+			log.Printf("Save correction mode failed: %v", err)
+		}
+		a.refreshCorrectionModeItems(mode)
+		if a.tray != nil {
+			a.notifyCorrectionMode(mode, &cfgCopy)
+		}
+		log.Printf("Correction mode = %s", mode)
+	}()
 }
 
-func (a *App) notifyCorrectionToggle(enabled bool, cfg *config.Config) {
-	if !enabled {
+// refreshCorrectionModeItems checks only the selected mode's item and unchecks
+// the rest, so the correction modes behave as a single-select group with the
+// same styling as the engine list.
+func (a *App) refreshCorrectionModeItems(selected string) {
+	for mode, item := range a.correctionModeItems {
+		if item != nil {
+			item.SetChecked(mode == selected)
+		}
+	}
+}
+
+// notifyCorrectionMode reports the result of a mode switch. For local/combined
+// it reuses the local-model readiness check; for llm/combined it mentions the
+// timeout and fail-open behavior.
+func (a *App) notifyCorrectionMode(mode string, cfg *config.Config) {
+	switch mode {
+	case config.CorrectionModeOff:
 		notify.NotifyAux("语音纠错", "已关闭", true)
-		return
+	case config.CorrectionModeLocal:
+		notify.NotifyAux("语音纠错", a.localCorrectionReadiness(cfg), true)
+	case config.CorrectionModeLLM:
+		notify.NotifyAux("语音纠错",
+			fmt.Sprintf("已启用 LLM 纠错，超时 %dms，失败自动回退原文", cfg.LLMCorrectionTimeout().Milliseconds()), true)
+	case config.CorrectionModeCombined:
+		notify.NotifyAux("语音纠错",
+			fmt.Sprintf("已启用 本地+LLM 纠错；%s；LLM 超时 %dms，失败自动回退原文",
+				a.localCorrectionReadiness(cfg), cfg.LLMCorrectionTimeout().Milliseconds()), true)
 	}
+}
+
+// localCorrectionReadiness returns a short status describing whether the local
+// correction model is ready, extracted from the former notifyCorrectionToggle
+// so both local and combined modes can reuse it.
+func (a *App) localCorrectionReadiness(cfg *config.Config) string {
 	if cfg.Corrections.Strategy == "" {
-		notify.NotifyAux("语音纠错", "已启用（仅用户词典）", true)
-		return
+		return "本地纠错已启用（仅用户词典）"
 	}
 	set := models.ForCorrectionStrategy(cfg.Corrections.Strategy)
 	if len(set) == 0 {
-		notify.NotifyAux("语音纠错", "配置的模型策略无效，请检查配置文件", true)
-		return
+		return "本地纠错已启用，但模型策略无效，请检查配置文件"
 	}
 	missing := models.Check(cfg.CorrectionsModelDir(), set)
 	if len(missing) > 0 {
-		notify.NotifyAux("语音纠错",
-			fmt.Sprintf("已启用，但缺少 %d 个模型文件；请点托盘“下载模型”自动获取", len(missing)), true)
-		return
+		return fmt.Sprintf("本地纠错已启用，但缺少 %d 个模型文件；请点托盘“下载模型”自动获取", len(missing))
 	}
-	notify.NotifyAux("语音纠错", "已启用，模型已就绪", true)
+	return "本地纠错已启用，模型已就绪"
 }
 
 // StatisticsEnabled reports whether successful voice-input pastes are being
@@ -399,7 +453,7 @@ func (a *App) startDownload() {
 	request := models.DownloadRequest{
 		EngineName:         a.cfg.Engine,
 		EngineBaseDir:      a.cfg.ModelBaseDir(),
-		CorrectionsEnabled: a.cfg.Corrections.Enabled,
+		CorrectionsEnabled: a.cfg.UseLocalCorrection(),
 		CorrectionStrategy: a.cfg.Corrections.Strategy,
 		CorrectionBaseDir:  a.cfg.CorrectionsModelDir(),
 	}
@@ -534,7 +588,7 @@ func (a *App) reloadConfig() {
 		}
 		engineName := newCfg.Engine
 		hotkeyEnabled := newCfg.HotkeyEnabled
-		correctionsEnabled := newCfg.Corrections.Enabled
+		correctionMode := config.NormalizeCorrectionMode(newCfg.CorrectionMode)
 		statisticsEnabled := newCfg.Statistics.Enabled
 		a.mu.Unlock()
 
@@ -546,9 +600,7 @@ func (a *App) reloadConfig() {
 		if a.hotkeyItem != nil {
 			a.hotkeyItem.SetChecked(hotkeyEnabled)
 		}
-		if a.correctionsItem != nil {
-			a.correctionsItem.SetChecked(correctionsEnabled)
-		}
+		a.refreshCorrectionModeItems(correctionMode)
 		if a.statisticsItem != nil {
 			a.statisticsItem.SetChecked(statisticsEnabled)
 		}

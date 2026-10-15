@@ -16,7 +16,7 @@ func TestNewServiceFromConfigDictionaryOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.DefaultConfig()
-	cfg.Corrections.Enabled = true
+	cfg.CorrectionMode = config.CorrectionModeLocal
 	cfg.Corrections.Strategy = ""
 	cfg.Corrections.DictPath = dictPath
 
@@ -37,7 +37,7 @@ func TestNewServiceFromConfigModelFailureStillRunsDictionary(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.DefaultConfig()
-	cfg.Corrections.Enabled = true
+	cfg.CorrectionMode = config.CorrectionModeLocal
 	cfg.Corrections.ModelDir = filepath.Join(tempDir, "missing-models")
 	cfg.Corrections.DictPath = dictPath
 

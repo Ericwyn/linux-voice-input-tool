@@ -17,7 +17,7 @@ func TestCheckCorrectionsDisabled(t *testing.T) {
 
 func TestCheckCorrectionsReportsMissingFiles(t *testing.T) {
 	cfg := config.DefaultConfig()
-	cfg.Corrections.Enabled = true
+	cfg.CorrectionMode = config.CorrectionModeLocal
 	cfg.Corrections.ModelDir = t.TempDir()
 	cfg.Corrections.RuntimePath = filepath.Join(t.TempDir(), "libonnxruntime.so")
 	got := checkCorrections(cfg)
@@ -30,7 +30,7 @@ func TestCheckCorrectionsReady(t *testing.T) {
 	root := t.TempDir()
 	runtimePath := filepath.Join(root, "libonnxruntime.so")
 	cfg := config.DefaultConfig()
-	cfg.Corrections.Enabled = true
+	cfg.CorrectionMode = config.CorrectionModeLocal
 	cfg.Corrections.ModelDir = filepath.Join(root, "models")
 	cfg.Corrections.RuntimePath = runtimePath
 	paths, err := cfg.CorrectionModelPaths(cfg.Corrections.Strategy)

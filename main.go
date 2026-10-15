@@ -210,7 +210,7 @@ func runDownloadModels(cfg *config.Config) {
 	groups, err := models.RequiredDownloads(models.DownloadRequest{
 		EngineName:         cfg.Engine,
 		EngineBaseDir:      cfg.ModelBaseDir(),
-		CorrectionsEnabled: cfg.Corrections.Enabled,
+		CorrectionsEnabled: cfg.UseLocalCorrection(),
 		CorrectionStrategy: cfg.Corrections.Strategy,
 		CorrectionBaseDir:  cfg.CorrectionsModelDir(),
 	})
@@ -549,7 +549,7 @@ func runTestMode(cfg *config.Config) {
 // session package. Every failure is fail-open and leaves the recognition text
 // available for diagnostics.
 func applyConfiguredCorrections(cfg *config.Config, text string) string {
-	if text == "" || cfg == nil || !cfg.Corrections.Enabled {
+	if text == "" || cfg == nil || !cfg.UseLocalCorrection() {
 		return text
 	}
 	service, err := corrector.NewServiceFromConfig(cfg)

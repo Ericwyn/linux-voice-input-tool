@@ -41,7 +41,7 @@ func Run(cfg *config.Config) []Result {
 // links ONNX Runtime through sherpa-onnx, and the correction runner can locate
 // that loaded library in plain development builds as well as packaged ones.
 func checkCorrections(cfg *config.Config) []Result {
-	if cfg == nil || !cfg.Corrections.Enabled {
+	if cfg == nil || !cfg.UseLocalCorrection() {
 		return nil
 	}
 	if cfg.Corrections.Strategy == "" {

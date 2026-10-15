@@ -37,7 +37,7 @@
 - 🔌 **可切换引擎**：本地 SenseVoice / 本地 sherpa / 在线 whisper，按需选择。
 - 📦 **一键下载模型**：内置 `--download-models`，带下载进度和速度显示。
 - 🩺 **配置自检**：`--check-config` 一键检查环境依赖与模型是否就绪。
-- ✍️ **本地中文纠错**：可选 INT8 MacBERT/MDCSpell 模型 + 用户词典，最终粘贴前离线纠错，托盘即时开关。
+- ✍️ **文本纠错**：四种模式单选（关闭 / 本地 / LLM / 本地+LLM），本地用 INT8 MacBERT/MDCSpell 模型 + 用户词典离线纠错，LLM 走 OpenAI 兼容接口做语义级润色（硬超时失败回退原文），托盘即时切换。
 - 📊 **本地使用统计**：可选记录成功输入的匿名日汇总、字数、录音/端到端耗时和自动纠错数据，不保存输入文本。
 
 ---
@@ -59,7 +59,9 @@
     ↓ 停止录音
 对完整音频跑一次 SenseVoice（识别 + 标点）
     ↓
-可选中文纠错（BERT MLM → 用户词典）
+可选文本纠错（本地 BERT+词典 → 可选 LLM 润色）
+    ↓
+去尾部标点/空格（默认开启，始终最后一步）
     ↓
 剪贴板 + Ctrl+V 粘贴
 ```
@@ -323,8 +325,8 @@ linux-voice-input --stats --month 2026-08    # 指定月份
 - 系统托盘菜单：
   - **状态显示**（空闲 / 录音中…）
   - **启用热键监听**（勾选切换，立即生效并保存）
-  - **启用语音纠错**（勾选切换，立即生效并保存，不重载 ASR）
   - **启用语音统计 / 查看语音统计**（匿名日汇总；查看今日与最近 30 天）
+  - **纠错: 关闭 / 本地 / LLM / 本地+LLM**（单选切换，立即生效并保存，不重载 ASR；切到 LLM/本地+LLM 时会校验 LLM 配置，缺字段则不切换并提示）
   - **sensevoice / sherpa / whisper**（选择识别引擎）
   - **下载模型 / 环境检查**
   - **打开配置目录 / 重载配置**
@@ -389,8 +391,8 @@ sensevoice:
 
 audio:
   sample_rate: 16000
-corrections:
-  enabled: false                    # 可在托盘“启用语音纠错”即时切换
+correction_mode: off                # 纠错模式：off / local / llm / combined；托盘可单选切换
+corrections:                        # 本地纠错参数（correction_mode 为 local/combined 时生效）
   strategy: macbert-mdcspell-v2     # macbert-mdcspell-v2 / macbert4csc；留空为纯词典
   model_dir: /home/<user>/.linux-voice-input/models/correction
   runtime_path: ""                  # 通常留空，复用应用自带 libonnxruntime
@@ -400,6 +402,16 @@ corrections:
   timeout_ms: 1500
   num_threads: 4
   dict_path: ""                     # 留空则用 ~/.linux-voice-input/corrections.txt
+llm_correction:                     # LLM 纠错参数（correction_mode 为 llm/combined 时生效）
+  base_url: ""                      # OpenAI 兼容接口基址，如 https://api.openai.com/v1
+  api_key: ""                       # Bearer Key
+  model: ""                         # 如 gpt-4o-mini
+  prompt_template: |-               # 必须含占位符 {{text}}，粘贴前注入识别文本
+    你是一个中文语音转写纠错助手。请将下面这段语音识别结果中的错别字、同音词、多字漏字和明显的口语顺序问题纠正过来，使其通顺准确。只输出纠正后的文本，不要解释，不要加引号。
+
+    原文：{{text}}
+  timeout_ms: 2000                  # 硬超时，超时或失败自动回退原始识别结果
+  extra_params: {}                  # 透传到请求 JSON 的额外参数，如 {max_tokens: 500, top_p: 0.9}
 statistics:
   enabled: false                    # 可在托盘“启用语音统计”即时切换
 hotkey: alt+shift+g
@@ -453,8 +465,8 @@ whisper:
 | `audio.sample_rate` | 录音采样率，默认 16000 |
 | `hotkey` | 守护进程全局热键，如 `alt+shift+g`（修饰键：ctrl/alt/shift/super） |
 | `hotkey_enabled` | 守护进程启动时是否启用全局热键监听 |
-| `corrections.enabled` | 是否开启最终文本纠错（神经模型 + 用户词典），默认 `false`；托盘可即时切换 |
-| `corrections.strategy` | 神经模型：`macbert-mdcspell-v2`（默认）/ `macbert4csc`；空值表示纯词典 |
+| `correction_mode` | 纠错模式：`off`（关闭，默认）/ `local`（本地）/ `llm`（LLM）/ `combined`（本地+LLM）；托盘可单选切换 |
+| `corrections.strategy` | 本地神经模型：`macbert-mdcspell-v2`（默认）/ `macbert4csc`；空值表示纯词典 |
 | `corrections.model_dir` | 纠错模型根目录，默认 `~/.linux-voice-input/models/correction` |
 | `corrections.runtime_path` | ONNX Runtime 动态库；通常留空，自动复用应用自带运行库 |
 | `corrections.confidence_threshold` | 候选字最低概率，默认 `0.9` |
@@ -463,11 +475,17 @@ whisper:
 | `corrections.timeout_ms` | 单次最终纠错软超时，默认 1500ms |
 | `corrections.num_threads` | 纠错模型 CPU 推理线程数，默认 4 |
 | `corrections.dict_path` | 最后执行的用户词典路径；留空则用 `~/.linux-voice-input/corrections.txt` |
+| `llm_correction.base_url` | LLM OpenAI 兼容接口基址（内部拼 `/chat/completions`）；`llm`/`combined` 模式必填 |
+| `llm_correction.api_key` | LLM 接口密钥，作 `Authorization: Bearer`；`llm`/`combined` 模式必填 |
+| `llm_correction.model` | LLM chat 模型名，如 `gpt-4o-mini`；`llm`/`combined` 模式必填 |
+| `llm_correction.prompt_template` | 纠错 prompt，必须含占位符 `{{text}}`（粘贴前替换为识别文本）；缺占位符视为配置不完整 |
+| `llm_correction.timeout_ms` | LLM 请求硬超时，默认 2000ms；超时或任何失败自动回退原始识别结果 |
+| `llm_correction.extra_params` | 透传进请求 JSON 的额外参数（如 `max_tokens`/`top_p`，可覆盖 `temperature`）；`messages` 不可覆盖 |
 | `statistics.enabled` | 是否记录成功语音输入的匿名日汇总，默认 `false`；关闭只暂停新增，历史数据保留 |
 | `restore_clipboard` | 粘贴后是否尽量恢复原剪贴板内容；旧剪贴板无法完整读取时仍会优先输入识别文字 |
 | `remove_trailing_symbols` | 是否去掉识别结果末尾的标点、符号与空格（不影响句中标点），默认 `true`；需要末尾符号或空格时请自行补充 |
 
-> **旧配置自动迁移**：如果你的 `config.yaml` 还是旧的 `api:` 块格式（`api.engine` / `api.key` 等），程序会在加载时自动迁移到新的 `engine` + `whisper` 布局并回写，无需手动改动。
+> **旧配置自动迁移**：如果你的 `config.yaml` 还是旧的 `api:` 块格式（`api.engine` / `api.key` 等），程序会在加载时自动迁移到新的 `engine` + `whisper` 布局并回写，无需手动改动。纠错开关也同样自动迁移：旧的 `corrections.enabled: true` 会迁移为 `correction_mode: local`，`false` 或缺省迁移为 `off`，并回写一次。
 
 ### 本地语音输入统计
 
@@ -494,14 +512,24 @@ whisper:
 
 日文件是唯一数据源；最近 7/30 天、指定月份和全部累计都在查询时合并，不维护可能与日文件不一致的第二份总计。关闭统计只停止新增文件更新，不删除历史数据。当前只记录客观耗时，不配置传统打字速度，也不计算节省时间，后续分析工具可直接读取这些日文件。
 
-### 本地中文纠错（模型 + 用户词典）
+### 文本纠错（本地模型 / LLM / 联合）
 
-纠错发生在识别引擎完成最终识别之后、粘贴之前，对 sensevoice / sherpa / whisper 都生效：
+纠错发生在识别引擎完成最终识别之后、粘贴之前，对 sensevoice / sherpa / whisper 都生效。通过 `correction_mode` 单选四种模式（托盘也可直接切换）：
+
+| 模式 | 说明 |
+| --- | --- |
+| `off` | 关闭纠错，识别文本直接粘贴（仍受 `remove_trailing_symbols` 影响） |
+| `local` | 仅本地纠错：BERT 模型 + 用户词典，离线、无网络 |
+| `llm` | 仅 LLM 纠错：调用 OpenAI 兼容接口做语义级润色 |
+| `combined` | 本地 + LLM：先本地纠错，再把结果交给 LLM |
+
+完整处理顺序：
 
 ```text
 最终识别文本
-  -> 一个 BERT MLM 模型（高置信度、只改单个汉字）
-  -> 用户精确词典（最终决定权，可做不等长/英文替换）
+  -> 本地纠错（local/combined 时）：BERT MLM 高置信度改字 -> 用户精确词典最终决定
+  -> LLM 纠错（llm/combined 时）：OpenAI 兼容接口整体润色；超时/失败回退上一步结果
+  -> 去尾部标点与空格（remove_trailing_symbols 开启时，始终最后一步）
   -> 粘贴
 ```
 
@@ -512,14 +540,14 @@ whisper:
 | `macbert-mdcspell-v2`（默认） | [Macropodus/macbert4mdcspell_v2](https://huggingface.co/Macropodus/macbert4mdcspell_v2) | 约 114.4 MiB | 本地小样本召回更好、正确句无误改 |
 | `macbert4csc` | [shibing624/macbert4csc-base-chinese](https://huggingface.co/shibing624/macbert4csc-base-chinese) | 约 114.4 MiB | 成熟基准模型 |
 
-产品运行只依赖 Go 编译产物和已有 `libonnxruntime`。推荐直接使用内置下载器：先启用纠错并选择策略，再下载当前配置缺少的模型。
+本地纠错运行只依赖 Go 编译产物和已有 `libonnxruntime`。推荐直接使用内置下载器：先把 `correction_mode` 设为 `local`（或 `combined`）并选择策略，再下载当前配置缺少的模型。
 
 ```bash
-# 配置文件中设置 corrections.enabled: true 和所需 strategy 后：
+# 配置文件中设置 correction_mode: local 和所需 strategy 后：
 ./linux-voice-input --download-models
 
 # 或在守护进程托盘中：
-# 1. 勾选“启用语音纠错”
+# 1. 选择“纠错: 本地”（或“纠错: 本地+LLM”）
 # 2. 点击“下载模型”
 
 ./linux-voice-input --check-config
@@ -528,8 +556,8 @@ whisper:
 切换模型只需修改配置，然后重载并再次执行下载；下载器只补当前策略缺失的文件：
 
 ```yaml
+correction_mode: local
 corrections:
-  enabled: true
   strategy: macbert4csc  # 或 macbert-mdcspell-v2
 ```
 
@@ -545,7 +573,31 @@ python3 scripts/correction/prepare_models.py
 python3 scripts/correction/prepare_models.py --models macbert-mdcspell-v2
 ```
 
-准备好模型后，守护进程托盘勾选 **“启用语音纠错”** 即时生效，不会重载 SenseVoice。也可以编辑 `corrections.enabled` 后点击托盘“重载配置”。模型首次使用会懒加载，之后保持常驻；模型缺失或推理失败时原文透传，用户词典仍会继续执行。
+准备好模型后，守护进程托盘选择 **“纠错: 本地”**（或 **“纠错: 本地+LLM”**）即时生效，不会重载 SenseVoice。也可以编辑 `correction_mode` 后点击托盘“重载配置”。模型首次使用会懒加载，之后保持常驻；模型缺失或推理失败时原文透传，用户词典仍会继续执行。
+
+#### LLM 纠错（OpenAI 兼容接口）
+
+把 `correction_mode` 设为 `llm` 或 `combined`，并在 `llm_correction` 填好 `base_url` / `api_key` / `model`，即可在最终识别后调用一次 LLM 做整体润色纠错。要点：
+
+- **经典接口**：使用 `POST {base_url}/chat/completions` 非流式调用，`temperature` 默认 `0`，兼容大多数 OpenAI 兼容服务（OpenAI、各类自建网关、硅基流动等）。
+- **占位符注入**：`prompt_template` 里用 `{{text}}` 标记识别文本的插入位置，可出现多次；不含该占位符会被视为配置不完整。
+- **硬超时 + 回退**：`timeout_ms`（默认 2000ms）内未返回即放弃，直接用进入 LLM 这一步前的文本；网络错误、非 200、空返回等任何失败同样回退，绝不因为 LLM 不可用而丢失识别结果或卡住粘贴。
+- **额外参数**：`extra_params` 会合并进请求 JSON，可追加 `max_tokens`、`top_p` 等，或覆盖 `temperature`、`model`；但 `messages` 由程序掌控、不可覆盖。
+- **开关校验**：托盘切到“纠错: LLM / 本地+LLM”时会先校验上述必填项，缺字段则不切换并弹通知提示缺哪些；补全后点“重载配置”再切。
+- **与去尾符号的关系**：`remove_trailing_symbols`（默认开）是整个流程的最后一步，LLM 补回的句尾标点也会被去掉；若希望保留，把它设为 `false`。
+
+```yaml
+correction_mode: combined          # 先本地纠错，再 LLM 润色
+llm_correction:
+  base_url: https://api.openai.com/v1
+  api_key: sk-xxxxxxxx
+  model: gpt-4o-mini
+  timeout_ms: 2000
+  extra_params:
+    max_tokens: 500
+```
+
+> LLM 纠错会把识别文本发送到你配置的第三方接口，请自行评估隐私与成本；不需要时保持 `correction_mode: off` 或 `local` 即为纯本地运行。
 
 #### 本地模型评测
 
@@ -578,7 +630,7 @@ go run ./cmd/correction-eval --cases docs/correction-eval.example.jsonl
 
 启用步骤：
 
-1. 在托盘勾选“启用语音纠错”，或把 `corrections.enabled` 改成 `true`。
+1. 在托盘选择“纠错: 本地”（或“纠错: 本地+LLM”），或把 `correction_mode` 改成 `local`（或 `combined`）。
 2. 准备词典文件（默认 `~/.linux-voice-input/corrections.txt`），可直接拷仓库里的示例 [`docs/corrections.example.txt`](./docs/corrections.example.txt)：
    ```bash
    cp docs/corrections.example.txt ~/.linux-voice-input/corrections.txt

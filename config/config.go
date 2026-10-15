@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -122,6 +124,57 @@ const (
 	CorrectionStrategyMacBERT  = models.CorrectionStrategyMacBERT
 )
 
+// Correction modes select the final-text correction pipeline. They form a
+// single-select group (like the engine selector) rather than independent
+// toggles, so the active pipeline is always unambiguous.
+const (
+	// CorrectionModeOff disables all correction; recognized text is pasted
+	// unchanged (except for the unconditional trailing-symbol trim).
+	CorrectionModeOff = "off"
+	// CorrectionModeLocal runs the local BERT + dictionary pass only.
+	CorrectionModeLocal = "local"
+	// CorrectionModeLLM runs the LLM pass only.
+	CorrectionModeLLM = "llm"
+	// CorrectionModeCombined runs the local pass first, then the LLM pass.
+	CorrectionModeCombined = "combined"
+)
+
+// LLMCorrectionPlaceholder is the token in the prompt template replaced by the
+// recognized text before the request is sent.
+const LLMCorrectionPlaceholder = "{{text}}"
+
+// defaultLLMPromptTemplate is a ready-to-use correction prompt. It instructs the
+// model to output only the corrected text so the response can be pasted
+// verbatim, and injects the recognized text at the placeholder.
+const defaultLLMPromptTemplate = "你是一个中文语音转写纠错助手。" +
+	"请将下面这段语音识别结果中的错别字、同音词、多字漏字和明显的口语顺序问题纠正过来，使其通顺准确。" +
+	"只输出纠正后的文本，不要解释，不要加引号。\n\n原文：{{text}}"
+
+// LLMCorrectionConfig configures the optional LLM-based final-text correction.
+// It calls an OpenAI-compatible /v1/chat/completions endpoint after the local
+// pass. Any failure or timeout falls open to the input text, so a flaky network
+// never costs the user the recognized result.
+type LLMCorrectionConfig struct {
+	// BaseURL is the OpenAI-compatible API base, e.g. https://api.openai.com/v1.
+	// The client appends "/chat/completions".
+	BaseURL string `yaml:"base_url"`
+	// APIKey is sent as "Authorization: Bearer <key>".
+	APIKey string `yaml:"api_key"`
+	// Model is the chat model name, e.g. gpt-4o-mini.
+	Model string `yaml:"model"`
+	// PromptTemplate must contain LLMCorrectionPlaceholder, replaced by the
+	// recognized text before the request is sent.
+	PromptTemplate string `yaml:"prompt_template"`
+	// TimeoutMs is a hard timeout for the whole request; on timeout the input
+	// text is returned unchanged. Defaults to 2000 when non-positive.
+	TimeoutMs int `yaml:"timeout_ms"`
+	// ExtraParams is merged into the request JSON, letting the user set or
+	// override arbitrary fields (max_tokens, top_p, even temperature/model) for
+	// broad server compatibility. The messages field is always authoritative
+	// and cannot be overridden.
+	ExtraParams map[string]any `yaml:"extra_params"`
+}
+
 // CorrectionModelFiles are the two files required by a BERT MLM strategy.
 type CorrectionModelFiles struct {
 	Model string
@@ -161,9 +214,15 @@ type Config struct {
 	SenseVoice SenseVoiceConfig `yaml:"sensevoice"`
 	Whisper    WhisperConfig    `yaml:"whisper"`
 
-	Audio            AudioConfig         `yaml:"audio"`
-	Notifications    NotificationsConfig `yaml:"notifications"`
+	Audio         AudioConfig         `yaml:"audio"`
+	Notifications NotificationsConfig `yaml:"notifications"`
+	// CorrectionMode selects the final-text correction pipeline:
+	// off | local | llm | combined. It is the single source of truth for
+	// whether the local and/or LLM passes run, replacing the old
+	// corrections.enabled boolean (migrated on load).
+	CorrectionMode   string              `yaml:"correction_mode"`
 	Corrections      CorrectionsConfig   `yaml:"corrections"`
+	LLMCorrection    LLMCorrectionConfig `yaml:"llm_correction"`
 	Statistics       StatisticsConfig    `yaml:"statistics"`
 	RestoreClipboard bool                `yaml:"restore_clipboard"`
 	// RemoveTrailingSymbols strips any trailing punctuation and whitespace from
@@ -229,9 +288,13 @@ func DefaultConfig() *Config {
 		Audio: AudioConfig{
 			SampleRate: 16000,
 		},
+		// Correction off by default on a fresh install so new users see no
+		// behavior change; enabling it is a deliberate choice. Legacy configs
+		// are migrated from corrections.enabled by Load.
+		CorrectionMode: CorrectionModeOff,
 		Corrections: CorrectionsConfig{
-			// Off by default so existing users see no behavior change; turning
-			// it on is a deliberate opt-in. DictPath empty means the default
+			// Enabled is retained only for migrating pre-mode configs; the live
+			// switch is CorrectionMode. DictPath empty means the default
 			// <AppDir>/corrections.txt (resolved by CorrectionsDictPath).
 			Enabled:             false,
 			Strategy:            CorrectionStrategyMDCSpell,
@@ -243,6 +306,17 @@ func DefaultConfig() *Config {
 			TimeoutMs:           1500,
 			NumThreads:          4,
 			DictPath:            "",
+		},
+		LLMCorrection: LLMCorrectionConfig{
+			// Address/key/model empty so llm/combined modes fail the
+			// completeness check until the user fills them in; the prompt and
+			// timeout ship with working defaults.
+			BaseURL:        "",
+			APIKey:         "",
+			Model:          "",
+			PromptTemplate: defaultLLMPromptTemplate,
+			TimeoutMs:      2000,
+			ExtraParams:    nil,
 		},
 		Statistics: StatisticsConfig{
 			Enabled: false,
@@ -323,6 +397,63 @@ func (c *Config) CorrectionsModelDir() string {
 		return c.Corrections.ModelDir
 	}
 	return DefaultCorrectionsModelDir()
+}
+
+// NormalizeCorrectionMode maps empty or unknown values to a valid mode. An
+// empty value is normally resolved by migration (see migrateCorrectionMode);
+// any other unrecognized value degrades to off so a typo never silently calls
+// out to the network.
+func NormalizeCorrectionMode(mode string) string {
+	switch mode {
+	case CorrectionModeOff, CorrectionModeLocal, CorrectionModeLLM, CorrectionModeCombined:
+		return mode
+	default:
+		return CorrectionModeOff
+	}
+}
+
+// UseLocalCorrection reports whether the local BERT + dictionary pass runs
+// under the current mode.
+func (c *Config) UseLocalCorrection() bool {
+	return c.CorrectionMode == CorrectionModeLocal || c.CorrectionMode == CorrectionModeCombined
+}
+
+// UseLLMCorrection reports whether the LLM pass runs under the current mode.
+func (c *Config) UseLLMCorrection() bool {
+	return c.CorrectionMode == CorrectionModeLLM || c.CorrectionMode == CorrectionModeCombined
+}
+
+// LLMCorrectionComplete reports whether every field required to call the LLM is
+// present, returning the missing field labels so the tray can tell the user
+// exactly what to fill in. The prompt template must also contain the
+// placeholder, otherwise the recognized text has nowhere to be injected.
+func (c *Config) LLMCorrectionComplete() (ok bool, missing []string) {
+	l := c.LLMCorrection
+	if strings.TrimSpace(l.BaseURL) == "" {
+		missing = append(missing, "base_url")
+	}
+	if strings.TrimSpace(l.APIKey) == "" {
+		missing = append(missing, "api_key")
+	}
+	if strings.TrimSpace(l.Model) == "" {
+		missing = append(missing, "model")
+	}
+	if strings.TrimSpace(l.PromptTemplate) == "" {
+		missing = append(missing, "prompt_template")
+	} else if !strings.Contains(l.PromptTemplate, LLMCorrectionPlaceholder) {
+		missing = append(missing, "prompt_template(缺少占位符 "+LLMCorrectionPlaceholder+")")
+	}
+	return len(missing) == 0, missing
+}
+
+// LLMCorrectionTimeout returns the configured hard timeout, defaulting to 2s
+// when non-positive so a zeroed or legacy field still behaves sanely.
+func (c *Config) LLMCorrectionTimeout() time.Duration {
+	ms := c.LLMCorrection.TimeoutMs
+	if ms <= 0 {
+		ms = 2000
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 // CorrectionModelPaths resolves a supported strategy to its ONNX and BERT
@@ -434,6 +565,35 @@ func migrateLegacyAPI(raw []byte, cfg *Config) bool {
 	return true
 }
 
+// migrateCorrectionMode fills correction_mode for configs written before the
+// single-select mode existed. It probes the raw file (not cfg, whose field is
+// already seeded to the default by DefaultConfig) to tell "key absent" from
+// "key present". When the key is absent, the mode is derived from the legacy
+// corrections.enabled flag (true -> local, otherwise -> off); when present it
+// is normalized to a valid value. It returns true when it changed cfg so Load
+// rewrites the file once to persist the resolved mode.
+func migrateCorrectionMode(raw []byte, cfg *Config) bool {
+	var probe struct {
+		CorrectionMode *string `yaml:"correction_mode"`
+	}
+	if err := yaml.Unmarshal(raw, &probe); err == nil && probe.CorrectionMode != nil {
+		normalized := NormalizeCorrectionMode(*probe.CorrectionMode)
+		if normalized != cfg.CorrectionMode {
+			cfg.CorrectionMode = normalized
+			return true
+		}
+		return false
+	}
+	// No correction_mode key in the file: derive from the legacy flag and
+	// persist it (the key was missing, so writing it is always a change).
+	if cfg.Corrections.Enabled {
+		cfg.CorrectionMode = CorrectionModeLocal
+	} else {
+		cfg.CorrectionMode = CorrectionModeOff
+	}
+	return true
+}
+
 func Load() (*Config, error) {
 	cfg := DefaultConfig()
 
@@ -443,9 +603,11 @@ func Load() (*Config, error) {
 			return nil, err
 		}
 		migrated := migrateLegacyAPI(data, cfg)
+		migrated = migrateCorrectionMode(data, cfg) || migrated
 		cfg.ResolveModelPaths()
-		// Rewrite the file when we upgraded an old `api:` block, so the new
-		// engine/whisper layout is persisted and the migration runs only once.
+		// Rewrite the file when we upgraded an old `api:` block or filled in a
+		// missing correction_mode, so the new layout is persisted and the
+		// migration runs only once.
 		if migrated {
 			if err := Save(cfg); err != nil {
 				return nil, err
@@ -465,6 +627,7 @@ func Load() (*Config, error) {
 				return nil, err
 			}
 			migrateLegacyAPI(data, cfg)
+			migrateCorrectionMode(data, cfg)
 			cfg.ResolveModelPaths()
 			if err := Save(cfg); err != nil {
 				return nil, err

@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"linux-voice-input/config"
+	"linux-voice-input/corrector/llm"
 	"linux-voice-input/corrector/onnxbert"
 )
 
@@ -40,5 +41,29 @@ func NewServiceFromConfig(cfg *config.Config) (*Service, error) {
 	// Dictionary is deliberately last: explicit user terminology must win over
 	// a general model prediction. A missing file is a safe no-op.
 	strategies = append(strategies, New(cfg.CorrectionsDictPath()))
-	return NewService(cfg.Corrections.Enabled, strategies...), nil
+	// Enabled follows the single-select correction mode: the local pass runs in
+	// local and combined modes.
+	return NewService(cfg.UseLocalCorrection(), strategies...), nil
+}
+
+// NewLLMServiceFromConfig builds a correction service containing only the LLM
+// strategy. When the LLM config is incomplete it returns a disabled, empty
+// service, so the caller can always hold a non-nil service that simply passes
+// text through until the user fills in the configuration. When complete, the
+// service's enabled state follows the correction mode (llm or combined).
+func NewLLMServiceFromConfig(cfg *config.Config) *Service {
+	if cfg == nil {
+		return NewService(false)
+	}
+	if ok, _ := cfg.LLMCorrectionComplete(); !ok {
+		return NewService(false)
+	}
+	client := llm.NewClient(
+		cfg.LLMCorrection.BaseURL,
+		cfg.LLMCorrection.APIKey,
+		cfg.LLMCorrection.Model,
+		cfg.LLMCorrection.ExtraParams,
+	)
+	strategy := llm.NewStrategy(client, cfg.LLMCorrection.PromptTemplate, config.LLMCorrectionPlaceholder)
+	return NewService(cfg.UseLLMCorrection(), strategy)
 }

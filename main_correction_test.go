@@ -14,7 +14,7 @@ func TestApplyConfiguredCorrectionsInTestMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.DefaultConfig()
-	cfg.Corrections.Enabled = true
+	cfg.CorrectionMode = config.CorrectionModeLocal
 	cfg.Corrections.Strategy = ""
 	cfg.Corrections.DictPath = dictPath
 
@@ -28,7 +28,7 @@ func TestCorrectionIntegrationUsesAlreadyLoadedONNXRuntime(t *testing.T) {
 		t.Skip("set CORRECTION_INTEGRATION=1 after preparing the default MDCSpell model")
 	}
 	cfg := config.DefaultConfig()
-	cfg.Corrections.Enabled = true
+	cfg.CorrectionMode = config.CorrectionModeLocal
 	// A plain development binary has no sibling lib directory. The correction
 	// runner should discover the libonnxruntime already loaded by sherpa-onnx.
 	cfg.Corrections.RuntimePath = "/definitely/missing/libonnxruntime.so"
