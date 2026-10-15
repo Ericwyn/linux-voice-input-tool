@@ -8,28 +8,25 @@ import (
 )
 
 // setupTray builds the system tray icon and its context menu, storing handles to
-// the items that update at runtime (status, hotkey checkbox, engine markers).
-// The menu layout is:
+// the items that update at runtime (status, hotkey checkbox, info lines). The
+// tray is intentionally minimal: engine/correction selection, model download,
+// environment check and statistics all moved to the "设置" web panel. The menu
+// layout is:
 //
 //	状态: 空闲                 (disabled when idle; clickable to cancel while recording)
 //	---
 //	启用热键监听               (checkbox)
-//	启用语音统计               (checkbox)
-//	查看语音统计
 //	---
-//	纠错: 关闭|本地|LLM|本地+LLM  (checkboxes; single-select, only the active mode checked)
+//	引擎: <name>               (disabled info line; change in settings)
+//	纠错: <mode>               (disabled info line; change in settings)
 //	---
-//	sensevoice|sherpa|whisper   (checkboxes; only the active engine is checked)
-//	---
-//	下载模型 / 环境检查
-//	---
-//	打开配置目录 / 重载配置
+//	设置 / 打开配置目录 / 重载配置
 //	---
 //	Linux Voice Input x.y.z    (disabled; shows the running version)
 //	退出
 //
 // All click callbacks run on gogpu/systray's D-Bus goroutine; handlers that do
-// slow work (engine reload, download, checks) dispatch to their own goroutines.
+// slow work (reload, open browser) dispatch to their own goroutines.
 func (a *App) setupTray() {
 	tray := systray.New()
 	menu := systray.NewMenu()
@@ -47,42 +44,21 @@ func (a *App) setupTray() {
 	a.hotkeyItem = menu.AddCheckbox("启用热键监听", a.HotkeyEnabled(), func() {
 		a.toggleHotkey()
 	})
-	a.statisticsItem = menu.AddCheckbox("启用语音统计", a.StatisticsEnabled(), func() {
-		a.toggleStatistics()
-	})
-	menu.Add("查看语音统计", func() { a.showStatistics() })
 
 	menu.AddSeparator()
 
-	// Correction mode single-select group (off / local / llm / combined),
-	// styled like the engine group: only the active mode is checked.
-	selectedMode := a.CorrectionMode()
-	for _, m := range correctionModes {
-		mode := m.Mode
-		item := menu.AddCheckbox(m.Label, mode == selectedMode, func() {
-			a.selectCorrectionMode(mode)
-		})
-		a.correctionModeItems[mode] = item
-	}
+	// Engine and correction are shown as read-only info lines reflecting the
+	// current config; changing them (and model download / env check / stats) now
+	// lives in the "设置" web panel, keeping the tray minimal.
+	a.engineItem = menu.Add("", nil)
+	a.engineItem.SetDisabled(true)
+	a.correctionItem = menu.Add("", nil)
+	a.correctionItem.SetDisabled(true)
+	a.refreshInfoLines()
 
 	menu.AddSeparator()
 
-	selectedEngine := a.currentEngine()
-	for _, name := range engineNames {
-		engineName := name
-		item := menu.AddCheckbox(engineName, engineName == selectedEngine, func() {
-			a.selectEngine(engineName)
-		})
-		a.engineItems[engineName] = item
-	}
-
-	menu.AddSeparator()
-
-	a.downloadItem = menu.Add("下载模型", func() { a.toggleDownload() })
-	menu.Add("环境检查", func() { a.runEnvCheck() })
-
-	menu.AddSeparator()
-
+	menu.Add("设置", func() { a.openSettings() })
 	menu.Add("打开配置目录", func() { a.openConfigDir() })
 	menu.Add("重载配置", func() { a.reloadConfig() })
 
@@ -101,11 +77,4 @@ func (a *App) setupTray() {
 		Show()
 
 	a.tray = tray
-}
-
-// currentEngine returns the configured engine name under the lock.
-func (a *App) currentEngine() string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.cfg.Engine
 }

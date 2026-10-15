@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Linux Voice Input 设置</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <span class="brand-name">Linux Voice Input 设置</span>
+      </div>
+      <div class="search-wrap">
+        <input id="search" type="search" placeholder="搜索配置项…（按名称 / 说明）" autocomplete="off">
+      </div>
+      <div class="actions">
+        <button id="reset" class="btn btn-ghost" type="button">放弃更改</button>
+        <button id="save" class="btn btn-primary" type="button">保存并应用</button>
+      </div>
+    </div>
+    <div id="status" class="status" hidden></div>
+  </header>
+
+  <div class="layout">
+    <main id="content" class="content">
+      <div class="loading">正在加载配置…</div>
+    </main>
+    <nav id="nav" class="nav"></nav>
+  </div>
+
+  <footer class="footer">
+    <span>保存后会写入 <code>~/.linux-voice-input/config.yaml</code> 并自动重载守护进程。</span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

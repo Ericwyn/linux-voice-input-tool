@@ -8,11 +8,9 @@ package ui
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -24,21 +22,9 @@ import (
 	"linux-voice-input/models"
 	"linux-voice-input/notify"
 	"linux-voice-input/session"
+	"linux-voice-input/settings"
 	"linux-voice-input/stats"
 )
-
-// engineNames is the fixed set of selectable engines, in tray display order.
-var engineNames = []string{"sensevoice", "sherpa", "whisper"}
-
-// correctionModes is the fixed set of correction pipelines shown as a single-
-// select group in the tray, in display order. The labels share the "纠错: " prefix
-// so the group reads as one logical selector.
-var correctionModes = []struct{ Mode, Label string }{
-	{config.CorrectionModeOff, "纠错: 关闭"},
-	{config.CorrectionModeLocal, "纠错: 本地"},
-	{config.CorrectionModeLLM, "纠错: LLM"},
-	{config.CorrectionModeCombined, "纠错: 本地+LLM"},
-}
 
 // App wires together the system tray, global hotkey handler, and the shared
 // session controller.
@@ -54,21 +40,19 @@ type App struct {
 
 	// tray and the menu-item handles are created in setupTray and updated live
 	// from menu callbacks and the recording state-change callback.
-	tray                *systray.SystemTray
-	statusItem          *systray.MenuItem
-	hotkeyItem          *systray.MenuItem
-	correctionModeItems map[string]*systray.MenuItem
-	statisticsItem      *systray.MenuItem
-	engineItems         map[string]*systray.MenuItem
-	downloadItem        *systray.MenuItem
+	tray       *systray.SystemTray
+	statusItem *systray.MenuItem
+	hotkeyItem *systray.MenuItem
+	// engineItem and correctionItem are read-only info lines showing the current
+	// engine and correction mode; selection moved to the settings web panel.
+	engineItem     *systray.MenuItem
+	correctionItem *systray.MenuItem
 
-	// downloadMu guards downloadCancel, which is non-nil exactly while a model
-	// download is in flight. Cancelling it aborts the transfer; the download
-	// goroutine clears it and restores the menu label when it returns. It is a
-	// separate lock from mu so a click can query download state without
-	// contending on the config lock.
-	downloadMu     sync.Mutex
-	downloadCancel context.CancelFunc
+	// settingsServer is the on-demand loopback web UI for editing config and
+	// running tools (download / env check / stats). It is created lazily on the
+	// first "设置" click and then stays up (Start is idempotent); saving through
+	// it triggers reloadConfig via OnSaved.
+	settingsServer *settings.Server
 }
 
 // NewApp constructs the daemon UI: it initializes the global hotkey handler,
@@ -76,11 +60,9 @@ type App struct {
 // the notification "取消" action so clicking it cancels the active recording.
 func NewApp(cfg *config.Config, controller *session.Controller) *App {
 	app := &App{
-		controller:          controller,
-		cfg:                 cfg,
-		saveConfig:          config.Save,
-		engineItems:         make(map[string]*systray.MenuItem),
-		correctionModeItems: make(map[string]*systray.MenuItem),
+		controller: controller,
+		cfg:        cfg,
+		saveConfig: config.Save,
 	}
 
 	app.initHotkey()
@@ -175,280 +157,104 @@ func (a *App) toggleHotkey() {
 	}
 }
 
-// CorrectionMode returns the live correction mode in the UI configuration.
-func (a *App) CorrectionMode() string {
+// refreshInfoLines updates the read-only engine and correction tray labels to
+// reflect the live config. Engine/correction selection now lives in the
+// settings web panel; these lines are purely informational.
+func (a *App) refreshInfoLines() {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	return config.NormalizeCorrectionMode(a.cfg.CorrectionMode)
-}
-
-// selectCorrectionMode switches the correction pipeline from the tray single-
-// select group. Switching to a mode that uses the LLM (llm or combined) first
-// validates the LLM config; if it is incomplete the previous mode is kept, the
-// change is not persisted, and a notification lists the missing fields. This
-// mirrors the engine-switch + model-check pattern and never reloads the ASR
-// engine. It runs on its own goroutine so saving/notifying does not block the
-// D-Bus menu callback.
-func (a *App) selectCorrectionMode(mode string) {
-	go func() {
-		a.mu.Lock()
-		prev := config.NormalizeCorrectionMode(a.cfg.CorrectionMode)
-		if mode == prev {
-			a.mu.Unlock()
-			a.refreshCorrectionModeItems(prev)
-			return
-		}
-		needsLLM := mode == config.CorrectionModeLLM || mode == config.CorrectionModeCombined
-		if needsLLM {
-			if ok, missing := a.cfg.LLMCorrectionComplete(); !ok {
-				a.mu.Unlock()
-				// Keep the previous selection: do not switch, do not persist.
-				a.refreshCorrectionModeItems(prev)
-				notify.NotifyAux("语音纠错",
-					"LLM 配置不完整，缺少: "+strings.Join(missing, ", ")+"；请在配置文件补全后点托盘“重载配置”", true)
-				return
-			}
-		}
-		a.cfg.CorrectionMode = mode
-		cfgCopy := *a.cfg
-		saveConfig := a.saveConfig
-		a.mu.Unlock()
-
-		a.controller.SetCorrectionMode(mode)
-		if saveConfig == nil {
-			saveConfig = config.Save
-		}
-		if err := saveConfig(&cfgCopy); err != nil {
-			log.Printf("Save correction mode failed: %v", err)
-		}
-		a.refreshCorrectionModeItems(mode)
-		if a.tray != nil {
-			a.notifyCorrectionMode(mode, &cfgCopy)
-		}
-		log.Printf("Correction mode = %s", mode)
-	}()
-}
-
-// refreshCorrectionModeItems checks only the selected mode's item and unchecks
-// the rest, so the correction modes behave as a single-select group with the
-// same styling as the engine list.
-func (a *App) refreshCorrectionModeItems(selected string) {
-	for mode, item := range a.correctionModeItems {
-		if item != nil {
-			item.SetChecked(mode == selected)
-		}
-	}
-}
-
-// notifyCorrectionMode reports the result of a mode switch. For local/combined
-// it reuses the local-model readiness check; for llm/combined it mentions the
-// timeout and fail-open behavior.
-func (a *App) notifyCorrectionMode(mode string, cfg *config.Config) {
-	switch mode {
-	case config.CorrectionModeOff:
-		notify.NotifyAux("语音纠错", "已关闭", true)
-	case config.CorrectionModeLocal:
-		notify.NotifyAux("语音纠错", a.localCorrectionReadiness(cfg), true)
-	case config.CorrectionModeLLM:
-		notify.NotifyAux("语音纠错",
-			fmt.Sprintf("已启用 LLM 纠错，超时 %dms，失败自动回退原文", cfg.LLMCorrectionTimeout().Milliseconds()), true)
-	case config.CorrectionModeCombined:
-		notify.NotifyAux("语音纠错",
-			fmt.Sprintf("已启用 本地+LLM 纠错；%s；LLM 超时 %dms，失败自动回退原文",
-				a.localCorrectionReadiness(cfg), cfg.LLMCorrectionTimeout().Milliseconds()), true)
-	}
-}
-
-// localCorrectionReadiness returns a short status describing whether the local
-// correction model is ready, extracted from the former notifyCorrectionToggle
-// so both local and combined modes can reuse it.
-func (a *App) localCorrectionReadiness(cfg *config.Config) string {
-	if cfg.Corrections.Strategy == "" {
-		return "本地纠错已启用（仅用户词典）"
-	}
-	set := models.ForCorrectionStrategy(cfg.Corrections.Strategy)
-	if len(set) == 0 {
-		return "本地纠错已启用，但模型策略无效，请检查配置文件"
-	}
-	missing := models.Check(cfg.CorrectionsModelDir(), set)
-	if len(missing) > 0 {
-		return fmt.Sprintf("本地纠错已启用，但缺少 %d 个模型文件；请点托盘“下载模型”自动获取", len(missing))
-	}
-	return "本地纠错已启用，模型已就绪"
-}
-
-// StatisticsEnabled reports whether successful voice-input pastes are being
-// aggregated in the live UI configuration.
-func (a *App) StatisticsEnabled() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.cfg.Statistics.Enabled
-}
-
-// toggleStatistics changes collection only: disabling it keeps every existing
-// daily file intact so a later re-enable continues the historical series.
-func (a *App) toggleStatistics() {
-	a.mu.Lock()
-	enabled := !a.cfg.Statistics.Enabled
-	a.cfg.Statistics.Enabled = enabled
-	cfgCopy := *a.cfg
-	saveConfig := a.saveConfig
+	engine := a.cfg.Engine
+	mode := config.NormalizeCorrectionMode(a.cfg.CorrectionMode)
 	a.mu.Unlock()
-
-	a.controller.SetStatisticsEnabled(enabled)
-	if saveConfig == nil {
-		saveConfig = config.Save
+	if a.engineItem != nil {
+		a.engineItem.SetLabel("引擎: " + engine)
 	}
-	if err := saveConfig(&cfgCopy); err != nil {
-		log.Printf("Save statistics toggle failed: %v", err)
-	}
-	if a.statisticsItem != nil {
-		a.statisticsItem.SetChecked(enabled)
-	}
-	if a.tray != nil {
-		message := "已暂停，历史数据保留"
-		if enabled {
-			message = "已启用，只记录成功输入的匿名汇总"
-		}
-		notify.NotifyAux("语音输入统计", message, true)
-	}
-	log.Printf("Voice input statistics enabled=%v", enabled)
-}
-
-// showStatistics flushes this process's pending event queue, then reads only
-// the daily shards needed for today's and the rolling 30-day summaries.
-func (a *App) showStatistics() {
-	go func() {
-		if err := a.controller.FlushStatistics(); err != nil {
-			log.Printf("Flush statistics before view failed: %v", err)
-			notify.NotifyAux("语音输入统计", "保存统计失败: "+err.Error(), true)
-			return
-		}
-
-		now := time.Now()
-		today, err := stats.LoadRecent(config.StatsDir(), now, 1)
-		if err != nil {
-			log.Printf("Read today's statistics failed: %v", err)
-			notify.NotifyAux("语音输入统计", "读取统计失败: "+err.Error(), true)
-			return
-		}
-		recent, err := stats.LoadRecent(config.StatsDir(), now, 30)
-		if err != nil {
-			log.Printf("Read recent statistics failed: %v", err)
-			notify.NotifyAux("语音输入统计", "读取统计失败: "+err.Error(), true)
-			return
-		}
-
-		a.mu.Lock()
-		enabled := a.cfg.Statistics.Enabled
-		a.mu.Unlock()
-		notify.NotifyAux("语音输入统计", formatStatisticsView(enabled, today, recent), true)
-	}()
-}
-
-func formatStatisticsView(enabled bool, today, recent stats.Aggregate) string {
-	state := "已暂停"
-	if enabled {
-		state = "已启用"
-	}
-	return fmt.Sprintf("状态: %s\n今日: %s\n最近30天: %s",
-		state,
-		stats.FormatCounters(today.Totals),
-		stats.FormatCounters(recent.Totals),
-	)
-}
-
-// selectEngine switches the active recognition engine from the tray: it persists
-// the new engine, reloads the controller, refreshes the engine menu markers, and
-// then runs an immediate model check, notifying the user to download models when
-// any are missing. The work runs on its own goroutine so a slow engine reload
-// (which may reload local models) does not block the D-Bus menu callback.
-func (a *App) selectEngine(name string) {
-	go func() {
-		a.mu.Lock()
-		same := a.cfg.Engine == name
-		a.cfg.Engine = name
-		cfgCopy := *a.cfg
-		a.mu.Unlock()
-
-		if !same {
-			if err := config.Save(&cfgCopy); err != nil {
-				log.Printf("Save config failed: %v", err)
-				notify.NotifyAux("语音输入", "保存配置失败: "+err.Error(), true)
-				return
-			}
-			if err := a.controller.Reload(&cfgCopy); err != nil {
-				log.Printf("Controller reload failed: %v", err)
-			}
-			a.refreshEngineItems(name)
-		}
-		a.checkModelsNotify(name, cfgCopy.ModelBaseDir())
-	}()
-}
-
-// refreshEngineItems checks only the currently selected engine's menu item and
-// unchecks the rest, so the engine list behaves as a single-select group with
-// the same checkmark styling as the hotkey toggle.
-func (a *App) refreshEngineItems(selected string) {
-	for name, item := range a.engineItems {
-		item.SetChecked(name == selected)
+	if a.correctionItem != nil {
+		a.correctionItem.SetLabel("纠错: " + correctionModeLabel(mode))
 	}
 }
 
-// checkModelsNotify checks the local model set for the given engine and reports
-// the result via a notification. Engines with no local models (whisper) simply
-// confirm the switch.
-func (a *App) checkModelsNotify(engineName, baseDir string) {
-	set := models.ForEngine(engineName)
-	if len(set) == 0 {
-		notify.NotifyAux("语音输入", "已切换到 "+engineName+"（在线引擎，无需本地模型）", true)
-		return
-	}
-	missing := models.Check(baseDir, set)
-	if len(missing) == 0 {
-		notify.NotifyAux("语音输入", "已切换到 "+engineName+"，模型已就绪", true)
-		return
-	}
-	notify.NotifyAux("语音输入",
-		fmt.Sprintf("已切换到 %s，但缺少 %d 个模型文件，请点托盘“下载模型”获取", engineName, len(missing)),
-		true)
-}
-
-// toggleDownload is wired to the "下载模型 / 中断下载" menu item. It doubles as
-// start and stop: when a download is already running it cancels it; otherwise it
-// starts a new one. The single item flips its label between the two states so
-// the user always sees the action a click will perform.
-func (a *App) toggleDownload() {
-	a.downloadMu.Lock()
-	inFlight := a.downloadCancel != nil
-	a.downloadMu.Unlock()
-
-	if inFlight {
-		a.cancelDownload()
-		return
-	}
-	a.startDownload()
-}
-
-// cancelDownload aborts an in-flight download if one is running. The download
-// goroutine observes the cancelled context, reports the interruption, and
-// restores the menu label as it unwinds, so this only needs to trip the cancel
-// function. It is a no-op when nothing is downloading.
-func (a *App) cancelDownload() {
-	a.downloadMu.Lock()
-	cancel := a.downloadCancel
-	a.downloadMu.Unlock()
-
-	if cancel != nil {
-		cancel()
+// correctionModeLabel maps a mode id to its Chinese display name.
+func correctionModeLabel(mode string) string {
+	switch mode {
+	case config.CorrectionModeLocal:
+		return "本地"
+	case config.CorrectionModeLLM:
+		return "LLM"
+	case config.CorrectionModeCombined:
+		return "本地+LLM"
+	default:
+		return "关闭"
 	}
 }
 
-// startDownload downloads every model required by the live config: recognition
-// models plus the selected correction model when enabled, followed by the
-// shared ONNX Runtime libraries. It runs off the D-Bus callback goroutine and
-// remains cancellable through the same menu item.
-func (a *App) startDownload() {
+// statsProvider builds the settings.Options.Stats callback: it flushes pending
+// events, then aggregates today / rolling-30-day / all-time windows into the
+// display-ready shape the settings page renders. Engine/correction toggles and
+// the former tray statistics view are gone; this backs the stats web panel.
+func (a *App) statsProvider() (settings.StatsResponse, error) {
+	if err := a.controller.FlushStatistics(); err != nil {
+		log.Printf("Flush statistics before view failed: %v", err)
+	}
+	root := config.StatsDir()
+	now := time.Now()
+	today, err := stats.LoadRecent(root, now, 1)
+	if err != nil {
+		return settings.StatsResponse{}, err
+	}
+	recent, err := stats.LoadRecent(root, now, 30)
+	if err != nil {
+		return settings.StatsResponse{}, err
+	}
+	all, err := stats.LoadAll(root)
+	if err != nil {
+		return settings.StatsResponse{}, err
+	}
+	a.mu.Lock()
+	enabled := a.cfg.Statistics.Enabled
+	a.mu.Unlock()
+	return settings.StatsResponse{
+		Enabled: enabled,
+		Today:   statsPeriod("今日", today),
+		Recent:  statsPeriod("最近 30 天", recent),
+		All:     statsPeriod("全部累计", all),
+	}, nil
+}
+
+// statsPeriod converts one aggregate into the display-ready settings shape.
+func statsPeriod(label string, agg stats.Aggregate) settings.StatsPeriod {
+	c := agg.Totals
+	return settings.StatsPeriod{
+		Label:             label,
+		Days:              agg.Days,
+		SuccessfulInputs:  c.SuccessfulInputs,
+		Characters:        c.Characters,
+		HanCharacters:     c.HanCharacters,
+		CorrectedInputs:   c.CorrectedInputs,
+		RecordingDuration: stats.FormatDuration(c.RecordingDurationMS),
+		InputDuration:     stats.FormatDuration(c.InputDurationMS),
+	}
+}
+
+// doctorProvider builds the settings.Options.Doctor callback: it runs the shared
+// environment checks against the live config and maps them to the settings
+// shape. It replaces the former tray "环境检查" item.
+func (a *App) doctorProvider() []settings.DoctorItem {
+	a.mu.Lock()
+	cfgCopy := *a.cfg
+	a.mu.Unlock()
+	results := doctor.Run(&cfgCopy)
+	items := make([]settings.DoctorItem, 0, len(results))
+	for _, r := range results {
+		items = append(items, settings.DoctorItem{Name: r.Name, OK: r.OK, Detail: r.Detail})
+	}
+	return items
+}
+
+// downloadProvider builds the settings.DownloadFunc: it downloads every model
+// the live config needs (recognition + optional correction) plus the shared
+// ONNX runtime, emitting progress lines to the settings download console. It
+// replaces the former tray "下载模型" item.
+func (a *App) downloadProvider(ctx context.Context, emit func(string)) error {
 	a.mu.Lock()
 	request := models.DownloadRequest{
 		EngineName:         a.cfg.Engine,
@@ -461,98 +267,30 @@ func (a *App) startDownload() {
 
 	groups, err := models.RequiredDownloads(request)
 	if err != nil {
-		notify.NotifyAux("下载模型", "模型配置错误: "+err.Error(), true)
-		return
+		return fmt.Errorf("模型配置错误: %w", err)
 	}
 	if len(groups) == 0 {
-		notify.NotifyAux("下载模型", "当前配置无需本地模型", true)
-		return
+		emit("当前配置无需本地模型")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	onStatus := func(msg string) { emit(msg) }
+	onProgress := func(p models.DownloadProgress) { emit(p.String()) }
 
-	a.downloadMu.Lock()
-	if a.downloadCancel != nil {
-		// A download is already running; ignore this second start.
-		a.downloadMu.Unlock()
-		cancel()
-		return
-	}
-	a.downloadCancel = cancel
-	a.downloadMu.Unlock()
-
-	a.setDownloadItemLabel("中断下载")
-
-	go func() {
-		defer func() {
-			cancel()
-			a.downloadMu.Lock()
-			a.downloadCancel = nil
-			a.downloadMu.Unlock()
-			a.setDownloadItemLabel("下载模型")
-		}()
-
-		onStatus := func(msg string) { notify.NotifyAux("下载模型", msg, false) }
-		onProgress := func(p models.DownloadProgress) { notify.NotifyAux("下载模型", p.String(), false) }
-
-		for _, group := range groups {
-			onStatus(fmt.Sprintf("%s目录: %s", group.Label, group.BaseDir))
-			if err := models.DownloadMissing(ctx, group.BaseDir, group.Models, onStatus, onProgress); err != nil {
-				a.reportDownloadError(ctx, err)
-				return
-			}
+	for _, group := range groups {
+		emit(fmt.Sprintf("%s目录: %s", group.Label, group.BaseDir))
+		if err := models.DownloadMissing(ctx, group.BaseDir, group.Models, onStatus, onProgress); err != nil {
+			return err
 		}
-		// Local engines also need the sherpa-onnx shared libraries next to the
-		// binary (found via its $ORIGIN/lib rpath).
-		libDir := config.RuntimeLibDir()
-		if err := models.DownloadRuntimeLibrary(ctx, libDir, onStatus, onProgress); err != nil {
-			a.reportDownloadError(ctx, err)
-			return
-		}
-		notify.NotifyAux("下载模型", "全部模型与运行库已就绪", true)
-	}()
-}
-
-// reportDownloadError distinguishes a user-triggered interruption (cancelled
-// context) from a genuine transfer failure and notifies accordingly. A
-// cancellation surfaces as a context error either directly or wrapped by the
-// download helpers, so both the returned err and ctx are inspected.
-func (a *App) reportDownloadError(ctx context.Context, err error) {
-	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
-		notify.NotifyAux("下载模型", "已中断下载", true)
-		return
 	}
-	notify.NotifyAux("下载模型", "下载失败: "+err.Error(), true)
-}
-
-// setDownloadItemLabel updates the download menu item's label, guarding against
-// a nil item (the tray may be unavailable in a headless environment).
-func (a *App) setDownloadItemLabel(label string) {
-	if a.downloadItem != nil {
-		a.downloadItem.SetLabel(label)
+	// Local engines also need the sherpa-onnx shared libraries next to the
+	// binary (found via its $ORIGIN/lib rpath).
+	libDir := config.RuntimeLibDir()
+	emit("运行库目录: " + libDir)
+	if err := models.DownloadRuntimeLibrary(ctx, libDir, onStatus, onProgress); err != nil {
+		return err
 	}
-}
-
-// runEnvCheck runs the shared doctor checks and shows the report as a single
-// multi-line notification. It runs on its own goroutine because some checks make
-// D-Bus/exec calls.
-func (a *App) runEnvCheck() {
-	a.mu.Lock()
-	cfgCopy := *a.cfg
-	a.mu.Unlock()
-
-	go func() {
-		results := doctor.Run(&cfgCopy)
-		var builder strings.Builder
-		for _, r := range results {
-			mark := "✓"
-			if !r.OK {
-				mark = "✗"
-			}
-			builder.WriteString(fmt.Sprintf("[%s] %s: %s\n", mark, r.Name, r.Detail))
-		}
-		notify.NotifyAux("环境检查", strings.TrimRight(builder.String(), "\n"), true)
-	}()
+	emit("全部模型与运行库已就绪")
+	return nil
 }
 
 // openConfigDir opens the application directory (holding config.yaml and logs)
@@ -563,6 +301,41 @@ func (a *App) openConfigDir() {
 		log.Printf("open config dir failed: %v", err)
 		notify.NotifyAux("语音输入", "打开配置目录失败: "+err.Error(), true)
 	}
+}
+
+// openSettings starts the loopback settings web UI (idempotent) and opens it in
+// the default browser. The server is created lazily on first use and then stays
+// up for the daemon's lifetime. Saving through the page writes config.yaml and
+// fires OnSaved, which reuses the existing reloadConfig path so changes apply
+// live without a restart. Runs on its own goroutine off the D-Bus callback.
+func (a *App) openSettings() {
+	go func() {
+		a.mu.Lock()
+		if a.settingsServer == nil {
+			a.settingsServer = settings.NewServer(settings.Options{
+				// OnSaved runs on the server's request goroutine; reloadConfig
+				// itself dispatches to its own goroutine, so this returns fast.
+				OnSaved:  a.reloadConfig,
+				Stats:    a.statsProvider,
+				Doctor:   a.doctorProvider,
+				Download: a.downloadProvider,
+			})
+		}
+		server := a.settingsServer
+		a.mu.Unlock()
+
+		if err := server.Start(); err != nil {
+			log.Printf("Start settings server failed: %v", err)
+			notify.NotifyAux("语音输入", "启动设置服务失败: "+err.Error(), true)
+			return
+		}
+		if err := exec.Command("xdg-open", server.URL()).Start(); err != nil {
+			log.Printf("open settings page failed: %v", err)
+			// Fall back to telling the user the address so they can open it
+			// manually; the token is in the URL.
+			notify.NotifyAux("语音输入", "请在浏览器打开: "+server.URL(), true)
+		}
+	}()
 }
 
 // reloadConfig re-reads the config file from disk, applies it to the controller
@@ -586,24 +359,17 @@ func (a *App) reloadConfig() {
 		} else {
 			a.unbindHotkeyLocked()
 		}
-		engineName := newCfg.Engine
 		hotkeyEnabled := newCfg.HotkeyEnabled
-		correctionMode := config.NormalizeCorrectionMode(newCfg.CorrectionMode)
-		statisticsEnabled := newCfg.Statistics.Enabled
 		a.mu.Unlock()
 
 		if err := a.controller.Reload(newCfg); err != nil {
 			log.Printf("Controller reload failed: %v", err)
 		}
 
-		a.refreshEngineItems(engineName)
 		if a.hotkeyItem != nil {
 			a.hotkeyItem.SetChecked(hotkeyEnabled)
 		}
-		a.refreshCorrectionModeItems(correctionMode)
-		if a.statisticsItem != nil {
-			a.statisticsItem.SetChecked(statisticsEnabled)
-		}
+		a.refreshInfoLines()
 		notify.NotifyAux("语音输入", "配置已重载", true)
 	}()
 }

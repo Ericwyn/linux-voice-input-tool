@@ -1,51 +1,37 @@
 package ui
 
 import (
-	"strings"
 	"testing"
 
-	"linux-voice-input/config"
-	"linux-voice-input/session"
 	"linux-voice-input/stats"
 )
 
-func TestToggleStatisticsPersistsAndUpdatesController(t *testing.T) {
-	cfg := config.DefaultConfig()
-	controller := session.New(cfg)
-	defer controller.Close()
-
-	var saved *config.Config
-	app := &App{
-		cfg:        cfg,
-		controller: controller,
-		saveConfig: func(value *config.Config) error {
-			copy := *value
-			saved = &copy
-			return nil
+// TestStatsPeriod verifies the aggregate -> settings display-shape conversion,
+// including counter passthrough and duration formatting. Statistics are now a
+// read-only panel in the settings web UI (backed by statsProvider); the former
+// tray toggle and notification view were removed.
+func TestStatsPeriod(t *testing.T) {
+	agg := stats.Aggregate{
+		Days: 7,
+		Totals: stats.Counters{
+			SuccessfulInputs:    5,
+			Characters:          120,
+			HanCharacters:       100,
+			CorrectedInputs:     3,
+			RecordingDurationMS: 65000, // 1m5s
+			InputDurationMS:     70000,
 		},
 	}
-
-	app.toggleStatistics()
-	if !app.StatisticsEnabled() || !controller.StatisticsEnabled() {
-		t.Fatal("statistics not enabled in app/controller")
+	p := statsPeriod("最近 7 天", agg)
+	if p.Label != "最近 7 天" || p.Days != 7 {
+		t.Fatalf("label/days = %q/%d", p.Label, p.Days)
 	}
-	if saved == nil || !saved.Statistics.Enabled {
-		t.Fatalf("saved config = %#v", saved)
+	if p.SuccessfulInputs != 5 || p.Characters != 120 || p.HanCharacters != 100 || p.CorrectedInputs != 3 {
+		t.Fatalf("counters = %#v", p)
 	}
-
-	app.toggleStatistics()
-	if app.StatisticsEnabled() || controller.StatisticsEnabled() {
-		t.Fatal("statistics not disabled in app/controller")
-	}
-}
-
-func TestFormatStatisticsView(t *testing.T) {
-	today := stats.Aggregate{Totals: stats.Counters{SuccessfulInputs: 2, Characters: 20, HanCharacters: 18}}
-	recent := stats.Aggregate{Totals: stats.Counters{SuccessfulInputs: 8, Characters: 90, HanCharacters: 70}}
-	view := formatStatisticsView(true, today, recent)
-	for _, want := range []string{"状态: 已启用", "今日: 2 次", "最近30天: 8 次"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("formatStatisticsView() = %q, missing %q", view, want)
-		}
+	// Durations are formatted via stats.FormatDuration; just assert non-empty so
+	// the test does not pin the exact format string.
+	if p.RecordingDuration == "" || p.InputDuration == "" {
+		t.Fatalf("durations not formatted: %#v", p)
 	}
 }
