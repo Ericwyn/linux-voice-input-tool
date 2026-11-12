@@ -342,7 +342,7 @@ func parseMode(args []string) runMode {
 // printUsage prints the command-line help. It intentionally needs no config so
 // it can run before any config/model loading.
 func printUsage() {
-	fmt.Print(version.String() + ` - 面向 Ubuntu/X11 的轻量语音输入工具
+	fmt.Print(version.String() + ` - 面向 Ubuntu（X11 / GNOME Wayland）的轻量语音输入工具
 
 用法:
   linux-voice-input [选项]

@@ -62,7 +62,12 @@ ICON_DIR="$PREFIX/share/icons/hicolor/512x512/apps"
 INSTALLED_BIN="$APP_DIR/$APP_NAME"
 SYMLINK="$BIN_DIR/$APP_NAME"
 ICON_DEST="$ICON_DIR/$APP_NAME.png"
-DESKTOP_FILE="$DESKTOP_DIR/$APP_NAME.desktop"
+# The desktop entry name must equal the XDG portal app id
+# (portal.AppID) so GNOME can attribute RemoteDesktop / GlobalShortcuts
+# permissions to this app on Wayland.
+APP_ID="io.github.ericwyn.LinuxVoiceInput"
+DESKTOP_FILE="$DESKTOP_DIR/$APP_ID.desktop"
+LEGACY_DESKTOP_FILE="$DESKTOP_DIR/$APP_NAME.desktop"
 
 echo "==> 安装 $DISPLAY_NAME 到 $APP_DIR"
 mkdir -p "$APP_DIR" "$BIN_DIR" "$DESKTOP_DIR" "$ICON_DIR"
@@ -102,6 +107,8 @@ Keywords=voice;speech;input;asr;
 StartupNotify=false
 EOF
 chmod 0644 "$DESKTOP_FILE"
+# Drop the entry written by older versions under the previous name.
+rm -f "$LEGACY_DESKTOP_FILE"
 
 # Refresh desktop/icon caches when the tools are available; ignore failures.
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$DESKTOP_DIR" || true

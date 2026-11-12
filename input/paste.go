@@ -9,7 +9,12 @@ import (
 )
 
 // GetActiveWindow returns the currently focused window ID
+// On Wayland it returns "" because clients cannot query other windows; the
+// focus stays on the original input field anyway.
 func GetActiveWindow() string {
+	if waylandSession() {
+		return ""
+	}
 	out, err := exec.Command("xdotool", "getactivewindow").Output()
 	if err != nil {
 		return ""
@@ -19,7 +24,7 @@ func GetActiveWindow() string {
 
 // FocusWindow focuses the window with the given ID
 func FocusWindow(windowID string) error {
-	if windowID == "" {
+	if windowID == "" || waylandSession() {
 		return nil
 	}
 	return exec.Command("xdotool", "windowactivate", "--sync", windowID).Run()
@@ -50,6 +55,21 @@ type pasteRuntime struct {
 }
 
 func PasteText(text string, restoreClipboard bool, targetWindow string) (PasteResult, error) {
+	if waylandSession() {
+		return pasteTextWithRuntime(text, restoreClipboard, "", pasteRuntime{
+			captureClipboard: captureClipboard,
+			startClipboardOwner: func(text string) (pasteClipboardOwner, error) {
+				return startClipboardOwner(text)
+			},
+			focusWindow: FocusWindow,
+			// Portal-injected keys come from a separate virtual keyboard, so
+			// physically held modifiers cannot be released from here.
+			releaseModifiers: func() {},
+			simulatePaste:    simulatePastePortal,
+			sleep:            time.Sleep,
+			now:              time.Now,
+		})
+	}
 	return pasteTextWithRuntime(text, restoreClipboard, targetWindow, pasteRuntime{
 		captureClipboard: captureClipboard,
 		startClipboardOwner: func(text string) (pasteClipboardOwner, error) {

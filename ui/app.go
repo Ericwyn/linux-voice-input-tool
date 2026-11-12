@@ -19,6 +19,7 @@ import (
 	"linux-voice-input/config"
 	"linux-voice-input/doctor"
 	"linux-voice-input/hotkey"
+	"linux-voice-input/input"
 	"linux-voice-input/models"
 	"linux-voice-input/notify"
 	"linux-voice-input/session"
@@ -35,7 +36,7 @@ type App struct {
 
 	mu            sync.Mutex
 	cfg           *config.Config
-	hotkeyHandler *hotkey.Handler
+	hotkeyHandler hotkey.Handler
 	hotkeyBound   bool
 
 	// tray and the menu-item handles are created in setupTray and updated live
@@ -81,24 +82,28 @@ func NewApp(cfg *config.Config, controller *session.Controller) *App {
 	return app
 }
 
-// initHotkey creates the X11 hotkey handler, wires OnPress to the controller's
+// initHotkey creates the session-appropriate hotkey handler, wires OnPress to the controller's
 // Toggle, starts the event loop goroutine, and binds the hotkey if enabled.
 func (a *App) initHotkey() {
 	handler, err := hotkey.New()
 	if err != nil {
-		log.Printf("Global hotkey unavailable (X11 required): %v", err)
+		log.Printf("Global hotkey unavailable: %v", err)
 		return
 	}
+	log.Printf("Global hotkey backend: %s", handler.Backend())
 
-	handler.OnPress = a.controller.Toggle
+	handler.SetOnPress(a.controller.Toggle)
+	if waiter, ok := handler.(hotkey.ReleaseWaiter); ok {
+		input.SetBeforePortalPaste(func() { waiter.WaitReleased(time.Second) })
+	}
 	a.hotkeyHandler = handler
 
 	if a.cfg.HotkeyEnabled {
 		a.bindHotkeyLocked(a.cfg.Hotkey)
 	}
 
-	// The xgbutil event loop runs on its own X connection, independent of the
-	// tray's D-Bus loop, so it is safe to run in a separate goroutine.
+	// Each backend runs on its own connection (X11 or a private D-Bus
+	// connection), independent of the tray's loop, so a goroutine is safe.
 	go handler.Listen()
 }
 

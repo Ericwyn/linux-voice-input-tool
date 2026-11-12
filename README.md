@@ -1,6 +1,6 @@
 # Linux Voice Input
 
-面向 Ubuntu / X11 桌面的轻量语音输入工具。按一次快捷键开始录音，再按一次停止并识别，识别结果自动粘贴到当前光标所在的输入框。
+面向 Ubuntu 桌面（X11 与 GNOME Wayland）的轻量语音输入工具。按一次快捷键开始录音，再按一次停止并识别，识别结果自动粘贴到当前光标所在的输入框。
 
 - **不与输入法冲突**：识别结果通过「写入剪贴板 + 模拟 `Ctrl+V`」上屏，既不注入也不注册为输入法框架，因此与 ibus / fcitx 等中文输入法完全兼容、互不干扰，可与现有输入习惯并存。
 - **本地优先**：默认使用本地 SenseVoice 模型，完全离线，识别 + 标点一步到位。
@@ -88,14 +88,16 @@ Ubuntu / Debian：
 
 ```bash
 sudo apt install -y \
+  build-essential pkg-config \
   portaudio19-dev \
-  xdotool
+  xdotool   # 仅 X11 需要，Wayland 可省略
 ```
 
 | 依赖 | 用途 |
 | --- | --- |
+| `build-essential`、`pkg-config` | 编译 cgo 依赖（gcc、make、查找 portaudio） |
 | `portaudio19-dev` | 麦克风录音（编译时需要） |
-| `xdotool` | 获取 / 激活窗口并模拟 `Ctrl+V` |
+| `xdotool` | 仅 X11：获取 / 激活窗口并模拟 `Ctrl+V`（Wayland 不需要） |
 
 X11 剪贴板读写由程序通过 Go 的 `xgb` 依赖直接完成，不需要安装 `xclip`。
 
@@ -105,7 +107,14 @@ X11 剪贴板读写由程序通过 Go 的 `xgb` 依赖直接完成，不需要�
 sudo apt install -y libnotify-bin
 ```
 
-> 当前优先支持 **X11**。Wayland 下 X11 剪贴板和 `xdotool` 不可用，建议使用 X11 会话。
+> **Wayland（如 Ubuntu 26.04 的 GNOME）**：程序会自动识别会话类型并切换实现，不需要 `xdotool`。
+>
+> - 剪贴板经 XWayland 写入，GNOME 会同步给原生 Wayland 应用。
+> - `Ctrl+V` 通过 XDG 桌面门户的 RemoteDesktop 接口发送。首次粘贴时 GNOME 会弹出“远程控制”授权，允许后令牌保存在 `~/.linux-voice-input/remote-desktop.token`，之后不再询问；每次粘贴时顶栏会短暂出现远程控制图标。
+> - 守护进程热键通过 GlobalShortcuts 门户注册，首次启动时 GNOME 会请求确认快捷键（可在弹窗中修改）。之后 GNOME 会一直使用已保存的快捷键，配置文件里的 `hotkey` 不再生效；要修改请到系统“设置 → 应用 → Linux Voice Input → 全局快捷键”。
+> - 粘贴前会等热键松开再发送 `Ctrl+V`。如果仍按着 Alt/Shift 等修饰键，`Ctrl+V` 会变成别的组合键而粘贴失败，所以说完后请松开热键。
+> - Wayland 不允许读取或切换其他窗口的焦点，结果会粘贴到粘贴时的焦点窗口。录音期间请不要切换窗口。
+> - 门户依赖桌面项 `io.github.ericwyn.LinuxVoiceInput.desktop` 来识别本应用，请用 `make install` 安装。
 
 ### 2. 构建
 
@@ -659,12 +668,9 @@ Docker = 道克, 道客
 
 **没有自动输入 / 粘贴失败**
 
-1. 确认当前是 X11 会话（`echo $XDG_SESSION_TYPE`）。
-2. 确认已安装 `xdotool`（剪贴板读写已内置，不需要 `xclip`）。
-3. 确认活动窗口和模拟按键可用：
-   ```bash
-   xdotool getactivewindow
-   ```
+1. 运行 `./linux-voice-input --check-config`，确认会话类型被正确识别。
+2. X11：确认已安装 `xdotool`（剪贴板读写已内置，不需要 `xclip`），并确认 `xdotool getactivewindow` 可用。
+3. Wayland：确认已通过 `make install` 安装桌面项。如果误点了“远程控制”授权的拒绝，删除 `~/.linux-voice-input/remote-desktop.token` 后重试，会重新弹出授权。
 4. 查看日志：`tail -f ~/.linux-voice-input/run.log`。
 
 **识别结果为空**

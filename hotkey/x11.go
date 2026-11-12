@@ -1,0 +1,115 @@
+package hotkey
+
+import (
+	"fmt"
+	"log"
+	"strings"
+
+	"github.com/BurntSushi/xgb/xproto"
+	"github.com/BurntSushi/xgbutil"
+	"github.com/BurntSushi/xgbutil/keybind"
+	"github.com/BurntSushi/xgbutil/xevent"
+)
+
+// convertHotkey converts user-friendly format "ctrl+alt+v" to X11 format "control-mod1-v"
+func convertHotkey(key string) string {
+	parts := strings.Split(strings.ToLower(key), "+")
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		switch p {
+		case "ctrl", "control":
+			parts[i] = "control"
+		case "alt":
+			parts[i] = "mod1"
+		case "super", "win", "meta":
+			parts[i] = "mod4"
+		case "shift":
+			parts[i] = "shift"
+		default:
+			parts[i] = p
+		}
+	}
+	return strings.Join(parts, "-")
+}
+
+// x11Handler grabs the hotkey on the X11 root window. Under Wayland this only
+// sees keys typed into XWayland windows, so it is used on X11 sessions only.
+type x11Handler struct {
+	xu        *xgbutil.XUtil
+	OnPress   func()
+	OnRelease func()
+}
+
+func newX11() (*x11Handler, error) {
+	xu, err := xgbutil.NewConn()
+	if err != nil {
+		return nil, fmt.Errorf("connect to X server: %w", err)
+	}
+	keybind.Initialize(xu)
+	return &x11Handler{xu: xu}, nil
+}
+
+func (h *x11Handler) SetOnPress(fn func()) { h.OnPress = fn }
+
+func (h *x11Handler) Backend() string { return "X11" }
+
+func (h *x11Handler) Bind(hotkey string) error {
+	root := h.xu.RootWin()
+	xkey := convertHotkey(hotkey)
+
+	err := keybind.KeyPressFun(func(xu *xgbutil.XUtil, e xevent.KeyPressEvent) {
+		if h.OnPress != nil {
+			h.OnPress()
+		}
+	}).Connect(h.xu, root, xkey, true)
+	if err != nil {
+		return fmt.Errorf("bind key press %s (X11: %s): %w", hotkey, xkey, err)
+	}
+
+	err = keybind.KeyReleaseFun(func(xu *xgbutil.XUtil, e xevent.KeyReleaseEvent) {
+		if h.OnRelease != nil {
+			h.OnRelease()
+		}
+	}).Connect(h.xu, root, xkey, true)
+	if err != nil {
+		return fmt.Errorf("bind key release %s (X11: %s): %w", hotkey, xkey, err)
+	}
+
+	log.Printf("Hotkey bound: %s (X11: %s)", hotkey, xkey)
+	return nil
+}
+
+// Unbind detaches all key callbacks and ungrabs any grabbed keys on the root
+// window, so the hotkey stops firing. The event loop (Listen) can keep running.
+func (h *x11Handler) Unbind() {
+	root := h.xu.RootWin()
+	keybind.Detach(h.xu, root)
+	// AnyKey (0) + AnyModifier releases every grab this process holds on root.
+	xproto.UngrabKey(h.xu.Conn(), 0, root, xproto.ModMaskAny)
+}
+
+// GrabKeyboard grabs keyboard to detect release of modifier keys
+func (h *x11Handler) GrabKeyboard() {
+	xproto.GrabKeyboard(h.xu.Conn(), true, h.xu.RootWin(),
+		xproto.TimeCurrentTime, xproto.GrabModeAsync, xproto.GrabModeAsync)
+}
+
+func (h *x11Handler) UngrabKeyboard() {
+	xproto.UngrabKeyboard(h.xu.Conn(), xproto.TimeCurrentTime)
+}
+
+func (h *x11Handler) Listen() {
+	xevent.Main(h.xu)
+}
+
+func (h *x11Handler) Stop() {
+	xevent.Quit(h.xu)
+}
+
+// Close closes the underlying X connection. After Close the handler must not be
+// used again.
+func (h *x11Handler) Close() {
+	if h.xu != nil {
+		h.xu.Conn().Close()
+	}
+}

@@ -1,109 +1,54 @@
+// Package hotkey provides the daemon's global record-toggle hotkey. On X11 it
+// grabs the key on the root window; on Wayland it uses the XDG
+// GlobalShortcuts portal, because Wayland compositors do not let clients
+// observe keys typed into other windows.
 package hotkey
 
 import (
-	"fmt"
-	"log"
-	"strings"
+	"time"
 
-	"github.com/BurntSushi/xgb/xproto"
-	"github.com/BurntSushi/xgbutil"
-	"github.com/BurntSushi/xgbutil/keybind"
-	"github.com/BurntSushi/xgbutil/xevent"
+	"linux-voice-input/portal"
 )
 
-// convertHotkey converts user-friendly format "ctrl+alt+v" to X11 format "control-mod1-v"
-func convertHotkey(key string) string {
-	parts := strings.Split(strings.ToLower(key), "+")
-	for i, p := range parts {
-		p = strings.TrimSpace(p)
-		switch p {
-		case "ctrl", "control":
-			parts[i] = "control"
-		case "alt":
-			parts[i] = "mod1"
-		case "super", "win", "meta":
-			parts[i] = "mod4"
-		case "shift":
-			parts[i] = "shift"
-		default:
-			parts[i] = p
+// Handler is a global hotkey backend.
+type Handler interface {
+	// SetOnPress sets the callback run on each hotkey activation.
+	SetOnPress(fn func())
+	// Bind activates the given combo (e.g. "alt+shift+g"), replacing any
+	// previous binding.
+	Bind(combo string) error
+	// Unbind stops delivering the hotkey; Bind can be called again later.
+	Unbind()
+	// Listen runs the event loop until Stop; it may return immediately for
+	// backends that deliver events on their own goroutine.
+	Listen()
+	Stop()
+	Close()
+	// Backend names the implementation for logs and diagnostics.
+	Backend() string
+}
+
+// New picks the backend for the current session.
+func New() (Handler, error) {
+	// Return explicit nils so a failed constructor never yields a non-nil
+	// interface wrapping a nil pointer.
+	if portal.IsWayland() {
+		h, err := newPortal()
+		if err != nil {
+			return nil, err
 		}
+		return h, nil
 	}
-	return strings.Join(parts, "-")
-}
-
-type Handler struct {
-	xu        *xgbutil.XUtil
-	OnPress   func()
-	OnRelease func()
-}
-
-func New() (*Handler, error) {
-	xu, err := xgbutil.NewConn()
+	h, err := newX11()
 	if err != nil {
-		return nil, fmt.Errorf("connect to X server: %w", err)
+		return nil, err
 	}
-	keybind.Initialize(xu)
-	return &Handler{xu: xu}, nil
+	return h, nil
 }
 
-func (h *Handler) Bind(hotkey string) error {
-	root := h.xu.RootWin()
-	xkey := convertHotkey(hotkey)
-
-	err := keybind.KeyPressFun(func(xu *xgbutil.XUtil, e xevent.KeyPressEvent) {
-		if h.OnPress != nil {
-			h.OnPress()
-		}
-	}).Connect(h.xu, root, xkey, true)
-	if err != nil {
-		return fmt.Errorf("bind key press %s (X11: %s): %w", hotkey, xkey, err)
-	}
-
-	err = keybind.KeyReleaseFun(func(xu *xgbutil.XUtil, e xevent.KeyReleaseEvent) {
-		if h.OnRelease != nil {
-			h.OnRelease()
-		}
-	}).Connect(h.xu, root, xkey, true)
-	if err != nil {
-		return fmt.Errorf("bind key release %s (X11: %s): %w", hotkey, xkey, err)
-	}
-
-	log.Printf("Hotkey bound: %s (X11: %s)", hotkey, xkey)
-	return nil
-}
-
-// Unbind detaches all key callbacks and ungrabs any grabbed keys on the root
-// window, so the hotkey stops firing. The event loop (Listen) can keep running.
-func (h *Handler) Unbind() {
-	root := h.xu.RootWin()
-	keybind.Detach(h.xu, root)
-	// AnyKey (0) + AnyModifier releases every grab this process holds on root.
-	xproto.UngrabKey(h.xu.Conn(), 0, root, xproto.ModMaskAny)
-}
-
-// GrabKeyboard grabs keyboard to detect release of modifier keys
-func (h *Handler) GrabKeyboard() {
-	xproto.GrabKeyboard(h.xu.Conn(), true, h.xu.RootWin(),
-		xproto.TimeCurrentTime, xproto.GrabModeAsync, xproto.GrabModeAsync)
-}
-
-func (h *Handler) UngrabKeyboard() {
-	xproto.UngrabKeyboard(h.xu.Conn(), xproto.TimeCurrentTime)
-}
-
-func (h *Handler) Listen() {
-	xevent.Main(h.xu)
-}
-
-func (h *Handler) Stop() {
-	xevent.Quit(h.xu)
-}
-
-// Close closes the underlying X connection. After Close the handler must not be
-// used again.
-func (h *Handler) Close() {
-	if h.xu != nil {
-		h.xu.Conn().Close()
-	}
+// ReleaseWaiter is implemented by backends that know when the hotkey keys are
+// released. Pasting while the user still holds the hotkey's modifiers would
+// turn Ctrl+V into e.g. Ctrl+Alt+Shift+V, which applications ignore.
+type ReleaseWaiter interface {
+	WaitReleased(timeout time.Duration)
 }

@@ -14,6 +14,7 @@ import (
 
 	"linux-voice-input/config"
 	"linux-voice-input/models"
+	"linux-voice-input/portal"
 )
 
 // Result is the outcome of a single check.
@@ -81,11 +82,11 @@ func checkDisplayServer() Result {
 	sessionType := os.Getenv("XDG_SESSION_TYPE")
 	display := os.Getenv("DISPLAY")
 	switch {
-	case sessionType == "x11" || (sessionType == "" && display != ""):
+	case sessionType == "x11" || (sessionType == "" && display != "" && os.Getenv("WAYLAND_DISPLAY") == ""):
 		return Result{Name: "显示服务器", OK: true, Detail: "X11"}
-	case sessionType == "wayland":
-		return Result{Name: "显示服务器", OK: false,
-			Detail: "检测到 Wayland；X11 剪贴板/xdotool 粘贴不可用，建议使用 X11 会话"}
+	case portal.IsWayland():
+		return Result{Name: "显示服务器", OK: true,
+			Detail: "Wayland（通过桌面门户粘贴与注册热键）"}
 	default:
 		return Result{Name: "显示服务器", OK: false,
 			Detail: fmt.Sprintf("无法确定（XDG_SESSION_TYPE=%q, DISPLAY=%q）", sessionType, display)}
@@ -95,15 +96,19 @@ func checkDisplayServer() Result {
 func checkCommands() []Result {
 	var results []Result
 
-	required := []struct{ cmd, purpose string }{
-		{"xdotool", "聚焦窗口并模拟 Ctrl+V"},
-	}
-	for _, item := range required {
-		if path, err := exec.LookPath(item.cmd); err == nil {
-			results = append(results, Result{Name: item.cmd, OK: true, Detail: path})
-		} else {
-			results = append(results, Result{Name: item.cmd, OK: false,
-				Detail: fmt.Sprintf("未安装（%s）；请安装后重试", item.purpose)})
+	if portal.IsWayland() {
+		results = append(results, checkWayland()...)
+	} else {
+		required := []struct{ cmd, purpose string }{
+			{"xdotool", "聚焦窗口并模拟 Ctrl+V"},
+		}
+		for _, item := range required {
+			if path, err := exec.LookPath(item.cmd); err == nil {
+				results = append(results, Result{Name: item.cmd, OK: true, Detail: path})
+			} else {
+				results = append(results, Result{Name: item.cmd, OK: false,
+					Detail: fmt.Sprintf("未安装（%s）；请安装后重试", item.purpose)})
+			}
 		}
 	}
 
@@ -132,6 +137,64 @@ func checkNotificationService() Result {
 	}
 	return Result{Name: "桌面通知", OK: true,
 		Detail: "D-Bus 通知服务可用"}
+}
+
+// checkWayland verifies the pieces the Wayland path relies on: XWayland for
+// the clipboard, the RemoteDesktop portal for Ctrl+V, the GlobalShortcuts
+// portal for the daemon hotkey, and the desktop entry the portal uses to
+// identify this app.
+func checkWayland() []Result {
+	var results []Result
+
+	if display := os.Getenv("DISPLAY"); display != "" {
+		results = append(results, Result{Name: "XWayland 剪贴板", OK: true,
+			Detail: fmt.Sprintf("DISPLAY=%s", display)})
+	} else {
+		results = append(results, Result{Name: "XWayland 剪贴板", OK: false,
+			Detail: "DISPLAY 未设置，无法写入剪贴板；请确认 XWayland 可用"})
+	}
+
+	if portal.HasInterface("org.freedesktop.portal.RemoteDesktop") {
+		results = append(results, Result{Name: "粘贴（RemoteDesktop 门户）", OK: true,
+			Detail: "可用；首次粘贴会弹出“远程控制”授权，允许后会记住"})
+	} else {
+		results = append(results, Result{Name: "粘贴（RemoteDesktop 门户）", OK: false,
+			Detail: "不可用；请安装 xdg-desktop-portal 与 xdg-desktop-portal-gnome"})
+	}
+
+	if portal.HasInterface("org.freedesktop.portal.GlobalShortcuts") {
+		results = append(results, Result{Name: "全局热键（GlobalShortcuts 门户）", OK: true,
+			Detail: "可用；守护进程首次启动时会请求确认快捷键"})
+	} else {
+		results = append(results, Result{Name: "全局热键（GlobalShortcuts 门户）", OK: true,
+			Detail: "不可用；守护进程热键无效，请改用系统自定义快捷键运行 --record"})
+	}
+
+	results = append(results, checkDesktopEntry())
+	return results
+}
+
+func checkDesktopEntry() Result {
+	name := portal.AppID + ".desktop"
+	dirs := []string{}
+	if dataHome := os.Getenv("XDG_DATA_HOME"); dataHome != "" {
+		dirs = append(dirs, dataHome)
+	} else if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, ".local", "share"))
+	}
+	dataDirs := os.Getenv("XDG_DATA_DIRS")
+	if dataDirs == "" {
+		dataDirs = "/usr/local/share:/usr/share"
+	}
+	dirs = append(dirs, filepath.SplitList(dataDirs)...)
+	for _, dir := range dirs {
+		path := filepath.Join(dir, "applications", name)
+		if _, err := os.Stat(path); err == nil {
+			return Result{Name: "桌面项", OK: true, Detail: path}
+		}
+	}
+	return Result{Name: "桌面项", OK: false,
+		Detail: fmt.Sprintf("未找到 %s；门户需要它来识别本应用，请运行 make install（或分发包里的 install.sh）", name)}
 }
 
 func checkConfigFile() Result {

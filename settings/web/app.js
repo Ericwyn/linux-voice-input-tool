@@ -11,7 +11,7 @@ const TOKEN = new URLSearchParams(location.search).get("token") || "";
 const HINTS = {
   // ---- 常规 ----
   "engine":                 { label: "识别引擎", type: "enum", options: ["sensevoice", "sherpa", "whisper"], desc: "全局语音识别引擎：sensevoice 本地默认 / sherpa 本地 / whisper 在线" },
-  "hotkey":                 { label: "全局热键", desc: "触发录音开关的组合键，如 alt+shift+d（修饰键：ctrl/alt/shift/super）" },
+  "hotkey":                 { label: "全局热键", desc: "触发录音开关的组合键，如 alt+shift+d（修饰键：ctrl/alt/shift/super）。GNOME Wayland 下只在首次注册时生效，之后请在系统“设置 → 应用 → Linux Voice Input → 全局快捷键”中修改" },
   "hotkey_enabled":         { label: "启用全局热键", desc: "守护进程启动时是否监听全局热键" },
   "restore_clipboard":      { label: "恢复剪贴板", desc: "粘贴后尽量恢复原剪贴板内容；旧剪贴板无法完整读取时仍优先输入识别文字" },
   "remove_trailing_symbols":{ label: "去除末尾符号", desc: "粘贴前去掉识别结果末尾的标点、符号与空格（不影响句中标点，始终是最后一步）" },

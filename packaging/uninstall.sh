@@ -37,13 +37,14 @@ done
 APP_DIR="$PREFIX/share/$APP_NAME"
 SYMLINK="$PREFIX/bin/$APP_NAME"
 ICON_DEST="$PREFIX/share/icons/hicolor/512x512/apps/$APP_NAME.png"
-DESKTOP_FILE="$PREFIX/share/applications/$APP_NAME.desktop"
+DESKTOP_FILE="$PREFIX/share/applications/io.github.ericwyn.LinuxVoiceInput.desktop"
+LEGACY_DESKTOP_FILE="$PREFIX/share/applications/$APP_NAME.desktop"
 
 echo "==> 卸载 $DISPLAY_NAME（前缀: $PREFIX）"
 rm -rf "$APP_DIR"
 rm -f "$SYMLINK"
 rm -f "$ICON_DEST"
-rm -f "$DESKTOP_FILE"
+rm -f "$DESKTOP_FILE" "$LEGACY_DESKTOP_FILE"
 
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$PREFIX/share/applications" || true
 command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f "$PREFIX/share/icons/hicolor" || true
