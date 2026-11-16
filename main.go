@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -25,14 +26,42 @@ import (
 	"linux-voice-input/version"
 )
 
-const socketName = "linux-voice-input.sock"
+const (
+	socketName     = "linux-voice-input.sock"
+	daemonLockName = "linux-voice-input.daemon.lock"
+)
+
+func runtimeDir() string {
+	dir := os.Getenv("XDG_RUNTIME_DIR")
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	return dir
+}
 
 func socketPath() string {
-	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
-	if runtimeDir == "" {
-		runtimeDir = os.TempDir()
+	return filepath.Join(runtimeDir(), socketName)
+}
+
+// errDaemonRunning reports that another daemon already holds the instance lock.
+var errDaemonRunning = errors.New("another daemon is already running")
+
+// acquireDaemonLock takes an exclusive, non-blocking flock that is held for the
+// daemon's whole lifetime. The kernel drops it when the process exits, so a
+// crashed daemon never leaves a stale lock behind.
+func acquireDaemonLock() (*os.File, error) {
+	file, err := os.OpenFile(filepath.Join(runtimeDir(), daemonLockName), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open daemon lock: %w", err)
 	}
-	return filepath.Join(runtimeDir, socketName)
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, errDaemonRunning
+		}
+		return nil, fmt.Errorf("lock daemon lock: %w", err)
+	}
+	return file, nil
 }
 
 // sendCommand connects to a running instance (daemon or standalone recorder)
@@ -48,7 +77,14 @@ func sendCommand(sock, command string) bool {
 	return true
 }
 
+// listenSocket binds the control socket. A socket file that still accepts
+// connections belongs to a live instance and is left alone; only a stale file
+// from a dead process is removed before binding.
 func listenSocket(sock string) (net.Listener, error) {
+	if conn, err := net.DialTimeout("unix", sock, 200*time.Millisecond); err == nil {
+		conn.Close()
+		return nil, fmt.Errorf("socket %s is in use by a running instance", sock)
+	}
 	_ = os.Remove(sock)
 	listener, err := net.Listen("unix", sock)
 	if err != nil {
@@ -423,6 +459,16 @@ func runStandalone(cfg *config.Config) {
 // on the socket for forwarded toggles, registers the global hotkey, and runs
 // the systray-based app whose tray menu drives all interaction.
 func runDaemon(cfg *config.Config) {
+	lock, err := acquireDaemonLock()
+	if errors.Is(err, errDaemonRunning) {
+		log.Println("Daemon is already running, exiting")
+		return
+	}
+	if err != nil {
+		log.Fatalf("Failed to acquire daemon lock: %v", err)
+	}
+	defer lock.Close()
+
 	sock := socketPath()
 
 	listener, err := listenSocket(sock)
